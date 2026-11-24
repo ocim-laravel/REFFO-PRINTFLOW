@@ -64,7 +64,7 @@ Checklist singkat:
 - [ ] Pastikan stok minimum tinta/bahan pembantu dan data restock sebelum go-live.
 - [ ] Uji klik A3+, batch nesting 2–4 item, dan KPI produksi Owner.
 - [ ] Uji alur Supplier → PO → Kirim → Terima (stok bertambah) → Bayar (hutang berkurang).
-- [ ] Uji 4 event WhatsApp di menu **Owner → Integrasi & Pemeliharaan**; tanpa webhook status tetap `pending`.
+- [ ] Uji 5 event WhatsApp di menu **Owner → Integrasi & Pemeliharaan**; tanpa webhook status tetap `pending`.
 - [ ] Uji tanda tangan digital saat serah terima dan pastikan bukti terverifikasi di audit log.
 - [ ] Jalankan preview auto-clean TIFF sebelum menghapus; pastikan file master/preview tidak terhapus.
 
@@ -120,7 +120,7 @@ Untuk mode JSON, cukup salin `data/db.json` + folder `uploads/` saat aplikasi be
 | F. Supplier, PO, goods receipt & hutang dagang | Selesai (stock opname belum) |
 | F. Stok tinta, suku cadang, dan bahan pembantu (master + pemakaian) | Selesai |
 | G. Tanda tangan digital serah terima | Selesai (pelacakan kurir belum) |
-| G. WhatsApp Gateway otomatis 4 event | Selesai (outbox + webhook env) |
+| G. WhatsApp Gateway otomatis 5 event | Selesai (outbox + webhook env) |
 | H. Analisis KPI lanjutan & insentif tim otomatis (tarif editable) | Selesai |
 | H. Analisis profitabilitas per produk/klien | Selesai |
 | H. Multi-cabang workshop | Tidak diimplementasikan (sesuai permintaan) |
