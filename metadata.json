@@ -1,0 +1,6 @@
+{
+  "name": "Reffo PrintFlow — Sistem Monitoring Cetak",
+  "description": "Sistem ERP Percetakan & Advertising terintegrasi untuk manajemen nota, antrean desain, produksi cetak, finishing, SPK lapangan, stok bahan roll/offcut, dan laporan laba rugi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
