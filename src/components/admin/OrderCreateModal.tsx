@@ -9,6 +9,7 @@ import type {
   Order,
   PaymentStatus,
   Product,
+  TaxSettings,
 } from '../../types';
 import { KATEGORI_PELANGGAN_LABEL, STATUS_DESAIN_LABEL, formatDesimal, formatRupiah } from '../../lib/format';
 import { apiFetch } from '../../lib/api';
@@ -20,7 +21,8 @@ interface OrderCreateModalProps {
   finishings: Finishing[];
   instansis: Instansi[];
   customers: Customer[];
-  onCreated: (order: Order) => void;
+  taxSettings?: TaxSettings;
+  onCreated: (order: Order) => void | Promise<void>;
   onInstansiAdded: (instansi: Instansi) => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
@@ -57,6 +59,7 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
   finishings,
   instansis,
   customers,
+  taxSettings,
   onCreated,
   onInstansiAdded,
   onNotify,
@@ -94,6 +97,7 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
   const [briefingFile, setBriefingFile] = useState<File | null>(null);
 
   const [diskonNota, setDiskonNota] = useState('0');
+  const [biayaDesain, setBiayaDesain] = useState('0');
   const [ppnPersen, setPpnPersen] = useState('');
   const [pph23Persen, setPph23Persen] = useState('');
   const [jatuhTempo, setJatuhTempo] = useState('');
@@ -237,26 +241,51 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
         subtotal,
       };
     });
+    const biayaDesainNum = Math.max(0, Math.round(Number(biayaDesain) || 0));
+    totalSebelumDiskon += biayaDesainNum;
     const selectedInst = instansis.find((i) => i.id === Number(instansiId));
-    const effectivePpn =
-      ppnPersen !== ''
-        ? Number(ppnPersen) || 0
-        : selectedInst?.is_pkp
-          ? Number(selectedInst.ppn_persen ?? 11)
-          : Number(selectedInst?.ppn_persen ?? 0);
-    const effectivePph =
-      pph23Persen !== ''
-        ? Number(pph23Persen) || 0
-        : Number(selectedInst?.pph23_persen ?? 0);
+    const ppnDefaultGlobal = taxSettings?.ppn_persen_default ?? 11;
+    const pphDefaultGlobal = taxSettings?.pph23_persen_default ?? 2;
+    const autoPpn = selectedInst
+      ? Number(selectedInst.ppn_persen ?? 0) > 0
+        ? Number(selectedInst.ppn_persen)
+        : selectedInst.is_pkp
+          ? ppnDefaultGlobal
+          : selectedInst.ppn_persen === undefined
+            ? ppnDefaultGlobal
+            : 0
+      : ppnDefaultGlobal;
+    const autoPph = selectedInst
+      ? Number(selectedInst.pph23_persen ?? 0) > 0
+        ? Number(selectedInst.pph23_persen)
+        : taxSettings?.potong_pph23_otomatis && selectedInst.npwp
+          ? pphDefaultGlobal
+          : 0
+      : taxSettings?.potong_pph23_otomatis
+        ? pphDefaultGlobal
+        : 0;
+
+    const effectivePpn = ppnPersen !== '' ? Number(ppnPersen) || 0 : autoPpn;
+    const effectivePph = pph23Persen !== '' ? Number(pph23Persen) || 0 : autoPph;
     const diskonNotaPersen = Math.min(Math.max(Number(diskonNota) || 0, 0), 100);
     const diskonNotaNominal = Math.round((totalSebelumDiskon * diskonNotaPersen) / 100);
-    const dpp = totalSebelumDiskon - diskonNotaNominal;
-    const ppnNominal = Math.round((dpp * effectivePpn) / 100);
-    const pphNominal = Math.round((dpp * effectivePph) / 100);
-    const total = dpp + ppnNominal - pphNominal;
+    const basisSetelahDiskon = Math.max(0, totalSebelumDiskon - diskonNotaNominal);
+    const basisPajak = taxSettings?.ppn_termasuk_diskon === false ? totalSebelumDiskon : basisSetelahDiskon;
+
+    let dpp = basisPajak;
+    let ppnNominal = Math.round((dpp * effectivePpn) / 100);
+    let pphNominal = Math.round((dpp * effectivePph) / 100);
+    let total = Math.max(0, basisSetelahDiskon + ppnNominal - pphNominal);
+    if (taxSettings?.mode_harga === 'sudah_termasuk_ppn' && effectivePpn > 0) {
+      dpp = Math.round(basisPajak / (1 + effectivePpn / 100));
+      ppnNominal = Math.max(0, basisPajak - dpp);
+      pphNominal = Math.round((dpp * effectivePph) / 100);
+      total = Math.max(0, basisSetelahDiskon - pphNominal);
+    }
     return {
       rows,
       totalSebelumDiskon,
+      biayaDesainNum,
       diskonNotaPersen,
       diskonNotaNominal,
       dpp,
@@ -267,7 +296,7 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
       total,
       selectedInst,
     };
-  }, [items, products, kategori, instansis, instansiId, ppnPersen, pph23Persen, diskonNota]);
+  }, [items, products, kategori, instansis, instansiId, ppnPersen, pph23Persen, diskonNota, biayaDesain, taxSettings]);
 
   const addItemRow = () => {
     setItems((prev) => [
@@ -313,6 +342,7 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
         catatan_desain: catatanDesain,
         deadline: deadline || undefined,
         diskon_persen: calculated.diskonNotaPersen,
+        biaya_desain: calculated.biayaDesainNum,
         ppn_persen: calculated.effectivePpn,
         pph23_persen: calculated.effectivePph,
         jatuh_tempo: jatuhTempo || undefined,
@@ -348,7 +378,7 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
         method: 'POST',
         body: fd,
       });
-      onCreated(res.order);
+      await onCreated(res.order);
       onClose();
     } catch (err) {
       onNotify('error', err instanceof Error ? err.message : 'Gagal menyimpan nota.');
@@ -746,9 +776,15 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
               </h3>
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1.5">
                 <div className="flex items-center justify-between text-xs text-slate-600">
-                  <span>Subtotal item</span>
+                  <span>Subtotal item + jasa desain</span>
                   <span className="font-mono">{formatRupiah(calculated.totalSebelumDiskon)}</span>
                 </div>
+                {calculated.biayaDesainNum > 0 && (
+                  <div className="flex items-center justify-between text-xs text-slate-600">
+                    <span>Termasuk biaya desain</span>
+                    <span className="font-mono">{formatRupiah(calculated.biayaDesainNum)}</span>
+                  </div>
+                )}
                 <div className="flex items-center justify-between text-xs text-slate-600">
                   <span>Diskon nota ({calculated.diskonNotaPersen}%)</span>
                   <span className="font-mono text-rose-600">−{formatRupiah(calculated.diskonNotaNominal)}</span>
@@ -777,7 +813,18 @@ export const OrderCreateModal: React.FC<OrderCreateModalProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                <label className="text-xs font-medium text-slate-700">
+                  Biaya Desain (Rp)
+                  <input
+                    type="number"
+                    min={0}
+                    step="1000"
+                    value={biayaDesain}
+                    onChange={(e) => setBiayaDesain(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm font-mono"
+                  />
+                </label>
                 <label className="text-xs font-medium text-slate-700">
                   Diskon Nota (%)
                   <input

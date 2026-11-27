@@ -23,6 +23,8 @@ export const SerahTerimaView: React.FC<SerahTerimaViewProps> = ({
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [namaPengambil, setNamaPengambil] = useState('');
   const [noWaPengambil, setNoWaPengambil] = useState('');
+  const [kurirNama, setKurirNama] = useState('');
+  const [resiPengiriman, setResiPengiriman] = useState('');
   const [catatan, setCatatan] = useState('');
   const [foto, setFoto] = useState<File | null>(null);
   const [tandaTangan, setTandaTangan] = useState<string | null>(null);
@@ -114,6 +116,8 @@ export const SerahTerimaView: React.FC<SerahTerimaViewProps> = ({
       const fd = new FormData();
       fd.append('nama_pengambil', namaPengambil.trim());
       fd.append('no_wa_pengambil', noWaPengambil.trim());
+      if (kurirNama.trim()) fd.append('kurir_nama', kurirNama.trim());
+      if (resiPengiriman.trim()) fd.append('resi_pengiriman', resiPengiriman.trim());
       if (catatan.trim()) fd.append('catatan_pengecualian', catatan.trim());
       if (foto) fd.append('foto_serah_terima', foto);
       fd.append('tanda_tangan_pengambil', tandaTangan);
@@ -125,6 +129,8 @@ export const SerahTerimaView: React.FC<SerahTerimaViewProps> = ({
       setSelectedOrder(null);
       setNamaPengambil('');
       setNoWaPengambil('');
+      setKurirNama('');
+      setResiPengiriman('');
       setCatatan('');
       setFoto(null);
       setTandaTangan(null);
@@ -221,6 +227,8 @@ export const SerahTerimaView: React.FC<SerahTerimaViewProps> = ({
                             setSelectedOrder(order);
                             setNamaPengambil(order.customer?.nama_pelanggan ?? '');
                             setNoWaPengambil(order.customer?.no_wa ?? '');
+                            setKurirNama(order.kurir_nama ?? '');
+                            setResiPengiriman(order.resi_pengiriman ?? '');
                           }}
                           className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 whitespace-nowrap shrink-0 cursor-pointer"
                         >
@@ -273,6 +281,28 @@ export const SerahTerimaView: React.FC<SerahTerimaViewProps> = ({
                 onChange={(e) => setNoWaPengambil(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
               />
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Kurir / Pengiriman (Opsional)</label>
+                <input
+                  type="text"
+                  value={kurirNama}
+                  onChange={(e) => setKurirNama(e.target.value)}
+                  placeholder="Misal: JNE / Kurir Internal"
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">No. Resi (Opsional)</label>
+                <input
+                  type="text"
+                  value={resiPengiriman}
+                  onChange={(e) => setResiPengiriman(e.target.value)}
+                  placeholder="Nomor resi / tracking"
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+                />
+              </div>
             </div>
             <div>
               <div className="flex items-center justify-between mb-1">

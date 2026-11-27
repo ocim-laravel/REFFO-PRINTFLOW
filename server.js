@@ -2,18 +2,37 @@
 import "dotenv/config";
 import express from "express";
 import fs3 from "node:fs";
-import path3 from "node:path";
-import crypto2 from "node:crypto";
+import path4 from "node:path";
+import crypto3 from "node:crypto";
 import multer from "multer";
 import { GoogleGenAI, Type } from "@google/genai";
 
 // server/store.ts
 import fs2 from "node:fs";
 import path2 from "node:path";
+import crypto2 from "node:crypto";
 
 // server/auth.ts
 import crypto from "node:crypto";
-var SECRET = process.env.SESSION_SECRET || crypto.createHash("sha256").update(process.cwd()).digest("hex");
+var devFallbackSecret = null;
+var warnedDevSecret = false;
+function getSessionSecret() {
+  const configured = String(process.env.SESSION_SECRET ?? "").trim();
+  if (configured) return configured;
+  if (String(process.env.NODE_ENV ?? "").toLowerCase() === "production") {
+    throw new Error("SESSION_SECRET wajib diisi pada NODE_ENV=production.");
+  }
+  if (!devFallbackSecret) {
+    devFallbackSecret = crypto.randomBytes(48).toString("hex");
+  }
+  if (!warnedDevSecret) {
+    warnedDevSecret = true;
+    console.warn(
+      "[security] SESSION_SECRET kosong; memakai secret acak sementara untuk development. Token login akan hangus saat server restart."
+    );
+  }
+  return devFallbackSecret;
+}
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
   const derived = crypto.scryptSync(password, salt, 64).toString("hex");
@@ -38,14 +57,14 @@ function signSessionToken(uid, role) {
     exp: Date.now() + 7 * 24 * 60 * 60 * 1e3
   };
   const encoded = Buffer.from(JSON.stringify(payload), "utf-8").toString("base64url");
-  const sig = crypto.createHmac("sha256", SECRET).update(encoded).digest("base64url");
+  const sig = crypto.createHmac("sha256", getSessionSecret()).update(encoded).digest("base64url");
   return `${encoded}.${sig}`;
 }
 function verifySessionToken(token) {
   if (!token || !token.includes(".")) return null;
   const [encoded, sig] = token.split(".");
   if (!encoded || !sig) return null;
-  const expectedSig = crypto.createHmac("sha256", SECRET).update(encoded).digest("base64url");
+  const expectedSig = crypto.createHmac("sha256", getSessionSecret()).update(encoded).digest("base64url");
   const sigBuf = Buffer.from(sig);
   const expBuf = Buffer.from(expectedSig);
   if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
@@ -79,10 +98,51 @@ function parseCookie(cookieHeader, name) {
 import fs from "node:fs";
 import path from "node:path";
 import mysql from "mysql2/promise";
+var SYNC_TABLES = [
+  "users",
+  "instansis",
+  "customers",
+  "products",
+  "finishings",
+  "material_rolls",
+  "material_offcuts",
+  "print_machines",
+  "supplies",
+  "stok_cattoff",
+  "tinta_warna",
+  "shifts",
+  "suppliers",
+  "orders",
+  "order_items",
+  "cetak_grup",
+  "cetak_grup_item",
+  "pemakaian_tinta",
+  "supply_usages",
+  "print_batches",
+  "order_payments",
+  "design_revisions",
+  "advertising_spks",
+  "material_logs",
+  "operational_expenses",
+  "purchase_orders",
+  "goods_receipts",
+  "supplier_payments",
+  "whatsapp_outbox",
+  "whatsapp_gateway_config",
+  "tax_settings",
+  "insentif_rates",
+  "audit_logs"
+];
+function cloneState(state) {
+  return JSON.parse(JSON.stringify(state));
+}
 var MySqlAdapter = class {
   constructor() {
     this.pool = null;
     this.syncQueue = Promise.resolve();
+    this.lastPersisted = null;
+    this.tableColumns = /* @__PURE__ */ new Map();
+    this.tableColumnsLoaded = false;
   }
   isEnabled() {
     return (process.env.DB_DRIVER ?? "json").toLowerCase() === "mysql";
@@ -96,7 +156,7 @@ var MySqlAdapter = class {
       database: process.env.MYSQL_DATABASE ?? "reffo_printflow"
     };
   }
-  async initialize(seedState) {
+  async initialize(createSeed) {
     const cfg = this.getConfig();
     const bootstrapConn = await mysql.createConnection({
       host: cfg.host,
@@ -125,19 +185,37 @@ var MySqlAdapter = class {
       connectionLimit: 10
     });
     await this.migrateSchema();
+    await this.loadTableColumns();
     const [userRows] = await this.pool.query("SELECT COUNT(*) AS cnt FROM users");
     const count = Number(userRows[0]?.cnt ?? 0);
     if (count === 0) {
+      const seedState = createSeed();
       await this.writeSnapshot(seedState);
+      this.lastPersisted = cloneState(seedState);
       return seedState;
     }
-    return await this.loadSnapshot();
+    const loaded = await this.loadSnapshot();
+    this.lastPersisted = cloneState(loaded);
+    return loaded;
   }
   queuePersist(state) {
     if (!this.pool) return;
-    const cloned = JSON.parse(JSON.stringify(state));
-    this.syncQueue = this.syncQueue.then(() => this.writeSnapshot(cloned)).catch((err) => {
-      console.error("Gagal sinkronisasi ke MySQL:", err);
+    const cloned = cloneState(state);
+    this.syncQueue = this.syncQueue.then(async () => {
+      const conn = await this.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await this.persistDiff(conn, cloned);
+        await conn.commit();
+        this.lastPersisted = cloned;
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    }).catch((err) => {
+      console.error("Gagal sinkronisasi CRUD ke MySQL:", err);
     });
   }
   async migrateSchema() {
@@ -194,7 +272,15 @@ var MySqlAdapter = class {
       },
       { table: "order_items", column: "klik_per_lembar", ddl: "INT NOT NULL DEFAULT 1" },
       { table: "order_items", column: "ukuran_lembar", ddl: "VARCHAR(80) NULL" },
-      { table: "order_payments", column: "shift_id", ddl: "INT NULL" }
+      { table: "order_items", column: "ditata_at", ddl: "VARCHAR(40) NULL" },
+      { table: "order_items", column: "qty_tercetak", ddl: "INT NOT NULL DEFAULT 0" },
+      { table: "order_items", column: "acc_pelanggan_at", ddl: "VARCHAR(40) NULL" },
+      { table: "order_items", column: "acc_pelanggan_nama", ddl: "VARCHAR(150) NULL" },
+      { table: "order_items", column: "acc_pelanggan_id", ddl: "INT NULL" },
+      { table: "order_items", column: "foto_finishing", ddl: "VARCHAR(255) NULL" },
+      { table: "order_items", column: "foto_cetak_ulang", ddl: "VARCHAR(255) NULL" },
+      { table: "order_payments", column: "shift_id", ddl: "INT NULL" },
+      { table: "whatsapp_outbox", column: "media_path", ddl: "VARCHAR(255) NULL" }
     ];
     for (const item of columns) {
       const [rows] = await this.pool.query(
@@ -204,6 +290,25 @@ var MySqlAdapter = class {
       );
       if (Number(rows[0]?.cnt ?? 0) === 0) {
         await this.pool.query(`ALTER TABLE \`${item.table}\` ADD COLUMN \`${item.column}\` ${item.ddl}`);
+      }
+    }
+    const enumMigrations = [
+      {
+        table: "order_items",
+        column: "status_produksi",
+        ddl: "ENUM('menunggu_desain','proses_desain','menunggu_acc','revisi','antrean_cetak','siap_tata','proses_cetak','gagal_cetak','cetak_ulang','antrean_finishing','proses_finishing','siap_diambil','selesai','dibatalkan') NOT NULL DEFAULT 'menunggu_desain'",
+        marker: "'cetak_ulang'"
+      }
+    ];
+    for (const m of enumMigrations) {
+      const [rows] = await this.pool.query(
+        `SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+        [m.table, m.column]
+      );
+      const columnType = String(rows[0]?.COLUMN_TYPE ?? "");
+      if (columnType && !columnType.includes(m.marker)) {
+        await this.pool.query(`ALTER TABLE \`${m.table}\` MODIFY COLUMN \`${m.column}\` ${m.ddl}`);
       }
     }
     const tables = [
@@ -285,6 +390,117 @@ var MySqlAdapter = class {
           updated_by INT NULL,
           UNIQUE KEY uq_insentif_role_jenis (role, jenis)
         )`
+      },
+      {
+        name: "whatsapp_gateway_config",
+        ddl: `CREATE TABLE IF NOT EXISTS \`whatsapp_gateway_config\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          webhook_url VARCHAR(500) NOT NULL DEFAULT '',
+          webhook_token VARCHAR(500) NOT NULL DEFAULT '',
+          app_url VARCHAR(500) NOT NULL DEFAULT '',
+          aktif TINYINT(1) NOT NULL DEFAULT 0,
+          updated_at VARCHAR(40) NULL,
+          updated_by INT NULL
+        )`
+      },
+      {
+        name: "tax_settings",
+        ddl: `CREATE TABLE IF NOT EXISTS \`tax_settings\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          ppn_persen_default DECIMAL(5,2) NOT NULL DEFAULT 11,
+          pph23_persen_default DECIMAL(5,2) NOT NULL DEFAULT 2,
+          mode_harga ENUM('belum_termasuk_ppn','sudah_termasuk_ppn') NOT NULL DEFAULT 'belum_termasuk_ppn',
+          ppn_termasuk_diskon TINYINT(1) NOT NULL DEFAULT 1,
+          potong_pph23_otomatis TINYINT(1) NOT NULL DEFAULT 0,
+          updated_at VARCHAR(40) NULL,
+          updated_by INT NULL
+        )`
+      },
+      {
+        name: "stok_cattoff",
+        ddl: `CREATE TABLE IF NOT EXISTS \`stok_cattoff\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          kode VARCHAR(50) NOT NULL UNIQUE,
+          jenis_bahan VARCHAR(80) NOT NULL,
+          lebar_m DECIMAL(5,2) NOT NULL,
+          panjang_awal_m DECIMAL(8,2) NOT NULL,
+          panjang_sisa_m DECIMAL(8,2) NOT NULL,
+          status ENUM('aktif','habis') NOT NULL DEFAULT 'aktif',
+          created_at VARCHAR(40) NOT NULL,
+          updated_at VARCHAR(40) NOT NULL
+        )`
+      },
+      {
+        name: "tinta_warna",
+        ddl: `CREATE TABLE IF NOT EXISTS \`tinta_warna\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          kode VARCHAR(30) NOT NULL UNIQUE,
+          warna VARCHAR(50) NOT NULL,
+          satuan VARCHAR(20) NOT NULL DEFAULT 'ml',
+          stok_ml DECIMAL(12,2) NOT NULL DEFAULT 0,
+          stok_minimum_ml DECIMAL(12,2) NOT NULL DEFAULT 1000,
+          kapasitas_galon_ml DECIMAL(12,2) NOT NULL DEFAULT 5000,
+          roll_per_galon INT NOT NULL DEFAULT 6,
+          luas_per_roll_m2 DECIMAL(8,2) NOT NULL DEFAULT 224,
+          konsumsi_ml_per_m2 DECIMAL(8,2) NOT NULL DEFAULT 3.72,
+          aktif TINYINT(1) NOT NULL DEFAULT 1,
+          created_at VARCHAR(40) NOT NULL,
+          updated_at VARCHAR(40) NOT NULL
+        )`
+      },
+      {
+        name: "cetak_grup",
+        ddl: `CREATE TABLE IF NOT EXISTS \`cetak_grup\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          kode_grup VARCHAR(40) NOT NULL UNIQUE,
+          operator_id INT NOT NULL,
+          machine_id INT NOT NULL,
+          status ENUM('menunggu','dalam_proses','selesai','batal') NOT NULL DEFAULT 'menunggu',
+          tanggal VARCHAR(40) NOT NULL,
+          catatan TEXT NULL,
+          created_at VARCHAR(40) NOT NULL,
+          updated_at VARCHAR(40) NOT NULL,
+          FOREIGN KEY (operator_id) REFERENCES users(id),
+          FOREIGN KEY (machine_id) REFERENCES print_machines(id)
+        )`
+      },
+      {
+        name: "cetak_grup_item",
+        ddl: `CREATE TABLE IF NOT EXISTS \`cetak_grup_item\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          grup_id INT NOT NULL,
+          order_item_id INT NOT NULL,
+          qty_cetak INT NOT NULL,
+          panjang_file_m DECIMAL(8,2) NULL,
+          lebar_file_m DECIMAL(8,2) NULL,
+          sumber_bahan ENUM('roll','cattoff','offcut') NOT NULL DEFAULT 'roll',
+          roll_id INT NULL,
+          cattoff_id INT NULL,
+          offcut_id INT NULL,
+          offcut_lebar_m DECIMAL(5,2) NULL,
+          offcut_panjang_m DECIMAL(8,2) NULL,
+          masuk_wos_m2 DECIMAL(10,2) NOT NULL DEFAULT 0,
+          status ENUM('menunggu','selesai','kendala') NOT NULL DEFAULT 'menunggu',
+          catatan TEXT NULL,
+          updated_at VARCHAR(40) NOT NULL,
+          FOREIGN KEY (grup_id) REFERENCES cetak_grup(id) ON DELETE CASCADE,
+          FOREIGN KEY (order_item_id) REFERENCES order_items(id) ON DELETE CASCADE
+        )`
+      },
+      {
+        name: "pemakaian_tinta",
+        ddl: `CREATE TABLE IF NOT EXISTS \`pemakaian_tinta\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          order_item_id INT NOT NULL,
+          grup_id INT NULL,
+          tinta_warna_id INT NOT NULL,
+          warna VARCHAR(50) NOT NULL,
+          jumlah_ml DECIMAL(10,2) NOT NULL,
+          luas_cetak_m2 DECIMAL(10,2) NOT NULL,
+          created_at VARCHAR(40) NOT NULL,
+          FOREIGN KEY (order_item_id) REFERENCES order_items(id) ON DELETE CASCADE,
+          FOREIGN KEY (tinta_warna_id) REFERENCES tinta_warna(id)
+        )`
       }
     ];
     for (const table of tables) {
@@ -341,6 +557,159 @@ var MySqlAdapter = class {
     );
     return rows[0] ?? null;
   }
+  /** Lock seluruh baris tabel kecil (roll, tinta, produk) selama transaksi. */
+  async lockTable(conn, table) {
+    await conn.query(`SELECT id FROM \`${table}\` FOR UPDATE`);
+  }
+  /**
+   * Jalankan mutasi kritis di dalam satu transaksi MySQL:
+   * lock baris -> mutasi state di memori -> tulis diff CRUD -> commit.
+   * Semua persist lain diantrekan lewat syncQueue yang sama agar tidak ada
+   * snapshot lama yang menimpa hasil transaksi.
+   */
+  async runLocked(getState, lockTables, fn) {
+    if (!this.pool) return fn();
+    const task = this.syncQueue.then(async () => {
+      const conn = await this.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        for (const table of lockTables) {
+          await this.lockTable(conn, table);
+        }
+        const result = await fn();
+        const state = getState();
+        await this.persistDiff(conn, state);
+        this.lastPersisted = cloneState(state);
+        await conn.commit();
+        return result;
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    });
+    this.syncQueue = task.then(
+      () => void 0,
+      () => void 0
+    );
+    return task;
+  }
+  async loadTableColumns() {
+    if (!this.pool || this.tableColumnsLoaded) return;
+    for (const table of SYNC_TABLES) {
+      const [rows] = await this.pool.query(
+        `SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`,
+        [table]
+      );
+      this.tableColumns.set(
+        table,
+        rows.map((row) => String(row.name))
+      );
+    }
+    this.tableColumnsLoaded = true;
+  }
+  valueForColumn(row, column) {
+    if (column === "items_json") {
+      return JSON.stringify(row.items ?? []);
+    }
+    if (column === "item_ids") {
+      return JSON.stringify(row.item_ids ?? []);
+    }
+    const value = row[column];
+    if (value === void 0 || value === null) return null;
+    if (typeof value === "boolean") return value ? 1 : 0;
+    if (typeof value === "object") return JSON.stringify(value);
+    return value;
+  }
+  rowHasColumn(row, column) {
+    if (column === "items_json") return true;
+    if (column === "item_ids") return true;
+    return Object.prototype.hasOwnProperty.call(row, column);
+  }
+  rowChanged(old, next, columns) {
+    for (const column of columns) {
+      if (column === "id") continue;
+      if (!this.rowHasColumn(next, column)) continue;
+      if (JSON.stringify(this.valueForColumn(old, column)) !== JSON.stringify(this.valueForColumn(next, column))) {
+        return true;
+      }
+    }
+    return false;
+  }
+  /**
+   * Ganti writeSnapshot() DELETE + INSERT seluruh tabel dengan CRUD per baris.
+   * Hanya baris baru / berubah / terhapus yang disentuh.
+   */
+  async persistDiff(conn, state) {
+    await this.loadTableColumns();
+    const previous = this.lastPersisted;
+    const rowsFor = (table) => {
+      if (table === "whatsapp_gateway_config") {
+        return state.whatsapp_gateway_config ? [state.whatsapp_gateway_config] : [];
+      }
+      if (table === "tax_settings") {
+        return state.tax_settings ? [state.tax_settings] : [];
+      }
+      if (table === "print_machines") {
+        return state.machines;
+      }
+      return state[table] ?? [];
+    };
+    const previousRowsFor = (table) => {
+      if (!previous) return [];
+      if (table === "whatsapp_gateway_config") {
+        return previous.whatsapp_gateway_config ? [previous.whatsapp_gateway_config] : [];
+      }
+      if (table === "tax_settings") {
+        return previous.tax_settings ? [previous.tax_settings] : [];
+      }
+      if (table === "print_machines") {
+        return previous.machines;
+      }
+      return previous[table] ?? [];
+    };
+    for (const table of SYNC_TABLES) {
+      const columns = this.tableColumns.get(table) ?? [];
+      if (columns.length === 0) continue;
+      const oldRows = previousRowsFor(table);
+      const newRows = rowsFor(table);
+      const oldById = new Map(oldRows.map((row) => [Number(row.id), row]));
+      for (const row of newRows) {
+        const id = Number(row.id);
+        const old = oldById.get(id);
+        if (!old) {
+          const insertColumns = columns.filter((column) => this.rowHasColumn(row, column));
+          const placeholders = insertColumns.map(() => "?").join(", ");
+          await conn.query(
+            `INSERT INTO \`${table}\` (${insertColumns.map((c) => `\`${c}\``).join(", ")}) VALUES (${placeholders})`,
+            insertColumns.map((column) => this.valueForColumn(row, column))
+          );
+        } else if (this.rowChanged(old, row, columns)) {
+          const updateColumns = columns.filter(
+            (column) => column !== "id" && this.rowHasColumn(row, column)
+          );
+          if (updateColumns.length === 0) continue;
+          await conn.query(
+            `UPDATE \`${table}\` SET ${updateColumns.map((c) => `\`${c}\` = ?`).join(", ")} WHERE id = ?`,
+            [...updateColumns.map((column) => this.valueForColumn(row, column)), id]
+          );
+        }
+      }
+    }
+    for (const table of [...SYNC_TABLES].reverse()) {
+      const oldRows = previousRowsFor(table);
+      const newRows = rowsFor(table);
+      const newIds = new Set(newRows.map((row) => Number(row.id)));
+      for (const old of oldRows) {
+        const id = Number(old.id);
+        if (!newIds.has(id)) {
+          await conn.query(`DELETE FROM \`${table}\` WHERE id = ?`, [id]);
+        }
+      }
+    }
+  }
   async loadSnapshot() {
     if (!this.pool) throw new Error("MySQL pool belum terinisialisasi.");
     const [users] = await this.pool.query("SELECT id, name, email, role, password, active FROM users ORDER BY id");
@@ -354,6 +723,11 @@ var MySqlAdapter = class {
     const [supplies] = await this.pool.query("SELECT * FROM supplies ORDER BY id");
     const [supply_usages] = await this.pool.query("SELECT * FROM supply_usages ORDER BY id");
     const [print_batches] = await this.pool.query("SELECT * FROM print_batches ORDER BY id");
+    const [stok_cattoff] = await this.pool.query("SELECT * FROM stok_cattoff ORDER BY id");
+    const [tinta_warna] = await this.pool.query("SELECT * FROM tinta_warna ORDER BY id");
+    const [cetak_grup] = await this.pool.query("SELECT * FROM cetak_grup ORDER BY id");
+    const [cetak_grup_item] = await this.pool.query("SELECT * FROM cetak_grup_item ORDER BY id");
+    const [pemakaian_tinta] = await this.pool.query("SELECT * FROM pemakaian_tinta ORDER BY id");
     const [orders] = await this.pool.query("SELECT * FROM orders ORDER BY id");
     const [order_items] = await this.pool.query("SELECT * FROM order_items ORDER BY id");
     const [order_payments] = await this.pool.query("SELECT * FROM order_payments ORDER BY id");
@@ -368,6 +742,8 @@ var MySqlAdapter = class {
     const [goods_receipts] = await this.pool.query("SELECT * FROM goods_receipts ORDER BY id");
     const [supplier_payments] = await this.pool.query("SELECT * FROM supplier_payments ORDER BY id");
     const [whatsapp_outbox] = await this.pool.query("SELECT * FROM whatsapp_outbox ORDER BY id");
+    const [whatsapp_gateway_config] = await this.pool.query("SELECT * FROM whatsapp_gateway_config ORDER BY id LIMIT 1");
+    const [tax_settings] = await this.pool.query("SELECT * FROM tax_settings ORDER BY id LIMIT 1");
     const [insentif_rates] = await this.pool.query("SELECT * FROM insentif_rates ORDER BY id");
     const maxId = (rows) => rows.reduce((m, r) => Math.max(m, Number(r.id) || 0), 0);
     const num = (v) => v === null || v === void 0 ? null : Number(v);
@@ -446,6 +822,49 @@ var MySqlAdapter = class {
         luas_terpakai_m2: Number(b.luas_terpakai_m2 ?? 0),
         luas_waste_m2: Number(b.luas_waste_m2 ?? 0)
       })),
+      stok_cattoff: stok_cattoff.map((s) => ({
+        ...s,
+        lebar_m: Number(s.lebar_m),
+        panjang_awal_m: Number(s.panjang_awal_m),
+        panjang_sisa_m: Number(s.panjang_sisa_m)
+      })),
+      tinta_warna: tinta_warna.map((w) => ({
+        ...w,
+        stok_ml: Number(w.stok_ml ?? 0),
+        stok_minimum_ml: Number(w.stok_minimum_ml ?? 0),
+        kapasitas_galon_ml: Number(w.kapasitas_galon_ml ?? 5e3),
+        roll_per_galon: Number(w.roll_per_galon ?? 6),
+        luas_per_roll_m2: Number(w.luas_per_roll_m2 ?? 224),
+        konsumsi_ml_per_m2: Number(w.konsumsi_ml_per_m2 ?? 3.72),
+        aktif: Number(w.aktif ?? 1) === 1
+      })),
+      cetak_grup: cetak_grup.map((g) => ({
+        ...g,
+        operator_id: Number(g.operator_id),
+        machine_id: Number(g.machine_id)
+      })),
+      cetak_grup_item: cetak_grup_item.map((item) => ({
+        ...item,
+        grup_id: Number(item.grup_id),
+        order_item_id: Number(item.order_item_id),
+        qty_cetak: Number(item.qty_cetak),
+        panjang_file_m: num(item.panjang_file_m),
+        lebar_file_m: num(item.lebar_file_m),
+        roll_id: num(item.roll_id),
+        cattoff_id: num(item.cattoff_id),
+        offcut_id: num(item.offcut_id),
+        offcut_lebar_m: num(item.offcut_lebar_m),
+        offcut_panjang_m: num(item.offcut_panjang_m),
+        masuk_wos_m2: Number(item.masuk_wos_m2 ?? 0)
+      })),
+      pemakaian_tinta: pemakaian_tinta.map((p) => ({
+        ...p,
+        order_item_id: Number(p.order_item_id),
+        grup_id: num(p.grup_id),
+        tinta_warna_id: Number(p.tinta_warna_id),
+        jumlah_ml: Number(p.jumlah_ml),
+        luas_cetak_m2: Number(p.luas_cetak_m2)
+      })),
       orders: orders.map((o) => ({
         ...o,
         total_tagihan: Number(o.total_tagihan),
@@ -477,7 +896,12 @@ var MySqlAdapter = class {
         batch_id: num(i.batch_id),
         satuan_hitung: i.satuan_hitung ?? "pcs",
         klik_per_lembar: Number(i.klik_per_lembar ?? 1),
-        ukuran_lembar: i.ukuran_lembar ?? null
+        ukuran_lembar: i.ukuran_lembar ?? null,
+        ditata_at: i.ditata_at ?? null,
+        qty_tercetak: Number(i.qty_tercetak ?? 0),
+        acc_pelanggan_id: num(i.acc_pelanggan_id),
+        foto_finishing: i.foto_finishing ?? null,
+        foto_cetak_ulang: i.foto_cetak_ulang ?? null
       })),
       order_payments: order_payments.map((p) => ({
         ...p,
@@ -537,6 +961,26 @@ var MySqlAdapter = class {
         ...w,
         attempts: Number(w.attempts ?? 0)
       })),
+      whatsapp_gateway_config: whatsapp_gateway_config[0] ? {
+        ...whatsapp_gateway_config[0],
+        id: Number(whatsapp_gateway_config[0].id) || 1,
+        webhook_url: String(whatsapp_gateway_config[0].webhook_url ?? ""),
+        webhook_token: String(whatsapp_gateway_config[0].webhook_token ?? ""),
+        app_url: String(whatsapp_gateway_config[0].app_url ?? ""),
+        aktif: Number(whatsapp_gateway_config[0].aktif ?? 0) === 1,
+        updated_at: whatsapp_gateway_config[0].updated_at ?? null,
+        updated_by: num(whatsapp_gateway_config[0].updated_by)
+      } : null,
+      tax_settings: tax_settings[0] ? {
+        id: Number(tax_settings[0].id) || 1,
+        ppn_persen_default: Number(tax_settings[0].ppn_persen_default ?? 11),
+        pph23_persen_default: Number(tax_settings[0].pph23_persen_default ?? 2),
+        mode_harga: tax_settings[0].mode_harga === "sudah_termasuk_ppn" ? "sudah_termasuk_ppn" : "belum_termasuk_ppn",
+        ppn_termasuk_diskon: Number(tax_settings[0].ppn_termasuk_diskon ?? 1) === 1,
+        potong_pph23_otomatis: Number(tax_settings[0].potong_pph23_otomatis ?? 0) === 1,
+        updated_at: tax_settings[0].updated_at ?? null,
+        updated_by: num(tax_settings[0].updated_by)
+      } : null,
       insentif_rates: insentif_rates.map((r) => ({
         ...r,
         nominal: Number(r.nominal ?? 0),
@@ -554,6 +998,11 @@ var MySqlAdapter = class {
         supplies: maxId(supplies),
         supply_usages: maxId(supply_usages),
         print_batches: maxId(print_batches),
+        stok_cattoff: maxId(stok_cattoff),
+        tinta_warna: maxId(tinta_warna),
+        cetak_grup: maxId(cetak_grup),
+        cetak_grup_item: maxId(cetak_grup_item),
+        pemakaian_tinta: maxId(pemakaian_tinta),
         orders: maxId(orders),
         order_items: maxId(order_items),
         order_payments: maxId(order_payments),
@@ -579,9 +1028,16 @@ var MySqlAdapter = class {
       await conn.beginTransaction();
       await conn.query("SET FOREIGN_KEY_CHECKS = 0");
       const tables = [
+        "pemakaian_tinta",
+        "cetak_grup_item",
+        "cetak_grup",
         "print_batches",
         "supply_usages",
+        "tinta_warna",
+        "stok_cattoff",
         "whatsapp_outbox",
+        "whatsapp_gateway_config",
+        "tax_settings",
         "insentif_rates",
         "supplier_payments",
         "goods_receipts",
@@ -698,6 +1154,45 @@ var MySqlAdapter = class {
           ]
         );
       }
+      for (const c of state.stok_cattoff) {
+        await conn.query(
+          `INSERT INTO stok_cattoff (id, kode, jenis_bahan, lebar_m, panjang_awal_m, panjang_sisa_m, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            c.id,
+            c.kode,
+            c.jenis_bahan,
+            c.lebar_m,
+            c.panjang_awal_m,
+            c.panjang_sisa_m,
+            c.status,
+            c.created_at,
+            c.updated_at
+          ]
+        );
+      }
+      for (const w of state.tinta_warna) {
+        await conn.query(
+          `INSERT INTO tinta_warna (id, kode, warna, satuan, stok_ml, stok_minimum_ml, kapasitas_galon_ml,
+             roll_per_galon, luas_per_roll_m2, konsumsi_ml_per_m2, aktif, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            w.id,
+            w.kode,
+            w.warna,
+            w.satuan,
+            w.stok_ml,
+            w.stok_minimum_ml,
+            w.kapasitas_galon_ml,
+            w.roll_per_galon,
+            w.luas_per_roll_m2,
+            w.konsumsi_ml_per_m2,
+            w.aktif ? 1 : 0,
+            w.created_at,
+            w.updated_at
+          ]
+        );
+      }
       for (const f of state.finishings) {
         await conn.query(
           "INSERT INTO finishings (id, nama_finishing, ekstra_kiri_cm, ekstra_kanan_cm, ekstra_atas_cm, ekstra_bawah_cm) VALUES (?, ?, ?, ?, ?, ?)",
@@ -724,7 +1219,7 @@ var MySqlAdapter = class {
              status_desain, catatan_desain, lampiran_briefing, file_master_arsip, waktu_terima_desain, waktu_selesai_desain,
              tanda_tangan_desainer, tanda_tangan_admin, bukti_pelunasan, foto_serah_terima, tanda_tangan_pengambil, nama_pengambil, no_wa_pengambil,
              waktu_serah_terima, catatan_pengecualian, deadline, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             o.id,
             o.no_nota,
@@ -772,9 +1267,11 @@ var MySqlAdapter = class {
           `INSERT INTO order_items (id, order_id, nama_item, product_id, finishing_id, lebar_m, tinggi_m, qty, luas_tagihan_m2,
              harga_satuan_dipakai, harga_sebelum_diskon, diskon_persen, diskon_nominal, subtotal, status_produksi,
              machine_id, operator_id, finishing_user_id, waktu_mulai_cetak, waktu_selesai_cetak, klik_total, estimasi_tinta_ml, batch_id,
-             satuan_hitung, klik_per_lembar, ukuran_lembar,
-             acc_admin_id, waktu_acc, file_preview_acc, file_cetak_tiff, file_master_arsip, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             satuan_hitung, klik_per_lembar, ukuran_lembar, ditata_at, qty_tercetak,
+              acc_admin_id, waktu_acc, acc_pelanggan_id, acc_pelanggan_at, acc_pelanggan_nama,
+              file_preview_acc, file_cetak_tiff, file_master_arsip, foto_finishing, foto_cetak_ulang,
+              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             it.id,
             it.order_id,
@@ -802,13 +1299,79 @@ var MySqlAdapter = class {
             it.satuan_hitung ?? "pcs",
             it.klik_per_lembar ?? 1,
             it.ukuran_lembar ?? null,
+            it.ditata_at ?? null,
+            it.qty_tercetak ?? 0,
             it.acc_admin_id,
             it.waktu_acc,
+            it.acc_pelanggan_id ?? null,
+            it.acc_pelanggan_at ?? null,
+            it.acc_pelanggan_nama ?? null,
             it.file_preview_acc,
             it.file_cetak_tiff,
             it.file_master_arsip,
+            it.foto_finishing ?? null,
+            it.foto_cetak_ulang ?? null,
             it.created_at,
             it.updated_at
+          ]
+        );
+      }
+      for (const g of state.cetak_grup) {
+        await conn.query(
+          `INSERT INTO cetak_grup (id, kode_grup, operator_id, machine_id, status, tanggal, catatan, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            g.id,
+            g.kode_grup,
+            g.operator_id,
+            g.machine_id,
+            g.status,
+            g.tanggal,
+            g.catatan ?? null,
+            g.created_at,
+            g.updated_at
+          ]
+        );
+      }
+      for (const gi of state.cetak_grup_item) {
+        await conn.query(
+          `INSERT INTO cetak_grup_item (id, grup_id, order_item_id, qty_cetak, panjang_file_m, lebar_file_m,
+             sumber_bahan, roll_id, cattoff_id, offcut_id, offcut_lebar_m, offcut_panjang_m,
+             masuk_wos_m2, status, catatan, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            gi.id,
+            gi.grup_id,
+            gi.order_item_id,
+            gi.qty_cetak,
+            gi.panjang_file_m ?? null,
+            gi.lebar_file_m ?? null,
+            gi.sumber_bahan,
+            gi.roll_id ?? null,
+            gi.cattoff_id ?? null,
+            gi.offcut_id ?? null,
+            gi.offcut_lebar_m ?? null,
+            gi.offcut_panjang_m ?? null,
+            gi.masuk_wos_m2 ?? 0,
+            gi.status,
+            gi.catatan ?? null,
+            gi.updated_at
+          ]
+        );
+      }
+      for (const p of state.pemakaian_tinta) {
+        await conn.query(
+          `INSERT INTO pemakaian_tinta (id, order_item_id, grup_id, tinta_warna_id, warna, jumlah_ml, luas_cetak_m2, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            p.id,
+            p.order_item_id,
+            p.grup_id ?? null,
+            p.tinta_warna_id,
+            p.warna,
+            p.jumlah_ml,
+            p.luas_cetak_m2,
+            p.created_at
           ]
         );
       }
@@ -960,9 +1523,9 @@ var MySqlAdapter = class {
       }
       for (const w of state.whatsapp_outbox) {
         await conn.query(
-          `INSERT INTO whatsapp_outbox (id, event, dedupe_key, order_id, no_wa, pesan, link, status,
+          `INSERT INTO whatsapp_outbox (id, event, dedupe_key, order_id, no_wa, pesan, link, media_path, status,
              attempts, last_error, next_attempt_at, created_at, updated_at, sent_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             w.id,
             w.event,
@@ -971,6 +1534,7 @@ var MySqlAdapter = class {
             w.no_wa,
             w.pesan,
             w.link ?? null,
+            w.media_path ?? null,
             w.status,
             w.attempts ?? 0,
             w.last_error ?? null,
@@ -978,6 +1542,39 @@ var MySqlAdapter = class {
             w.created_at,
             w.updated_at,
             w.sent_at ?? null
+          ]
+        );
+      }
+      if (state.whatsapp_gateway_config) {
+        const c = state.whatsapp_gateway_config;
+        await conn.query(
+          `INSERT INTO whatsapp_gateway_config (id, webhook_url, webhook_token, app_url, aktif, updated_at, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            c.id || 1,
+            c.webhook_url ?? "",
+            c.webhook_token ?? "",
+            c.app_url ?? "",
+            c.aktif === false ? 0 : 1,
+            c.updated_at ?? null,
+            c.updated_by ?? null
+          ]
+        );
+      }
+      if (state.tax_settings) {
+        const t = state.tax_settings;
+        await conn.query(
+          `INSERT INTO tax_settings (id, ppn_persen_default, pph23_persen_default, mode_harga, ppn_termasuk_diskon, potong_pph23_otomatis, updated_at, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            t.id || 1,
+            t.ppn_persen_default,
+            t.pph23_persen_default,
+            t.mode_harga,
+            t.ppn_termasuk_diskon ? 1 : 0,
+            t.potong_pph23_otomatis ? 1 : 0,
+            t.updated_at ?? null,
+            t.updated_by ?? null
           ]
         );
       }
@@ -1014,6 +1611,240 @@ var MySqlAdapter = class {
 };
 var mysqlAdapter = new MySqlAdapter();
 
+// server/domain.ts
+function round2(val) {
+  return Math.round((val + Number.EPSILON) * 100) / 100;
+}
+function clampPercent(value) {
+  const num = Number(value ?? 0);
+  if (!Number.isFinite(num)) return 0;
+  return Math.min(Math.max(round2(num), 0), 100);
+}
+function parsePositiveId(raw) {
+  if (typeof raw === "number") {
+    return Number.isInteger(raw) && raw > 0 ? raw : null;
+  }
+  const text = String(raw ?? "").trim();
+  if (!/^\d+$/.test(text)) return null;
+  const num = Number(text);
+  return Number.isInteger(num) && Number.isSafeInteger(num) && num > 0 ? num : null;
+}
+function parseTanggalInput(raw) {
+  if (raw === void 0 || raw === null) return { valid: true, iso: null };
+  const text = String(raw).trim();
+  if (!text) return { valid: true, iso: null };
+  const dateOnlyMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnlyMatch) {
+    const tahun = Number(dateOnlyMatch[1]);
+    const bulan = Number(dateOnlyMatch[2]);
+    const tanggal = Number(dateOnlyMatch[3]);
+    if (bulan < 1 || bulan > 12 || tanggal < 1 || tanggal > 31) {
+      return { valid: false, iso: null };
+    }
+    const d = new Date(Date.UTC(tahun, bulan - 1, tanggal));
+    if (d.getUTCFullYear() !== tahun || d.getUTCMonth() !== bulan - 1 || d.getUTCDate() !== tanggal) {
+      return { valid: false, iso: null };
+    }
+    return { valid: true, iso: d.toISOString() };
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(text)) {
+    return { valid: false, iso: null };
+  }
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) {
+    return { valid: false, iso: null };
+  }
+  return { valid: true, iso: parsed.toISOString() };
+}
+function buildDefaultTaxSettings() {
+  return {
+    id: 1,
+    ppn_persen_default: 11,
+    pph23_persen_default: 2,
+    mode_harga: "belum_termasuk_ppn",
+    ppn_termasuk_diskon: true,
+    potong_pph23_otomatis: false,
+    updated_at: null,
+    updated_by: null
+  };
+}
+function computeEffectiveTaxRates(params) {
+  const globalTax = params.taxSettings ?? buildDefaultTaxSettings();
+  const inst = params.instansi;
+  const instansiPpn = Number(inst?.ppn_persen);
+  let defaultPpn = instansiPpn > 0 ? instansiPpn : globalTax.ppn_persen_default;
+  let defaultPph23 = 0;
+  if (inst) {
+    if (inst.pph23_persen !== void 0 && Number(inst.pph23_persen) > 0) {
+      defaultPph23 = Number(inst.pph23_persen);
+    } else if (globalTax.potong_pph23_otomatis && inst.npwp) {
+      defaultPph23 = globalTax.pph23_persen_default;
+    }
+  } else if (globalTax.potong_pph23_otomatis) {
+    defaultPph23 = globalTax.pph23_persen_default;
+  }
+  const hasPayloadPpn = params.payloadPpn !== void 0 && params.payloadPpn !== null && String(params.payloadPpn).trim() !== "";
+  const hasPayloadPph23 = params.payloadPph23 !== void 0 && params.payloadPph23 !== null && String(params.payloadPph23).trim() !== "";
+  return {
+    ppnPersen: clampPercent(hasPayloadPpn ? params.payloadPpn : defaultPpn),
+    pph23Persen: clampPercent(hasPayloadPph23 ? params.payloadPph23 : defaultPph23)
+  };
+}
+function hitungPajakNota(params) {
+  const subtotalItems = Math.max(0, round2(params.totalSebelumDiskonNota));
+  const diskonPersen = clampPercent(params.diskonNotaPersen);
+  const diskonNominal = round2(subtotalItems * diskonPersen / 100);
+  const ppnPersen = clampPercent(params.ppnPersen);
+  const pph23Persen = clampPercent(params.pph23Persen);
+  const basisSetelahDiskon = Math.max(0, round2(subtotalItems - diskonNominal));
+  const basisPajak = params.ppnTermasukDiskon !== false ? basisSetelahDiskon : subtotalItems;
+  if (params.modeHarga === "sudah_termasuk_ppn" && ppnPersen > 0) {
+    const dpp2 = round2(basisPajak / (1 + ppnPersen / 100));
+    const ppnNominal2 = round2(basisPajak - dpp2);
+    const pph23Nominal2 = round2(dpp2 * pph23Persen / 100);
+    const totalTagihan2 = round2(Math.max(0, basisSetelahDiskon - pph23Nominal2));
+    return { diskonNominal, dpp: dpp2, ppnNominal: ppnNominal2, pph23Nominal: pph23Nominal2, totalTagihan: totalTagihan2 };
+  }
+  const dpp = basisPajak;
+  const ppnNominal = round2(dpp * ppnPersen / 100);
+  const pph23Nominal = round2(dpp * pph23Persen / 100);
+  const totalTagihan = round2(Math.max(0, basisSetelahDiskon + ppnNominal - pph23Nominal));
+  return { diskonNominal, dpp, ppnNominal, pph23Nominal, totalTagihan };
+}
+var EDITABLE_MASTER_EXTENSIONS = [".ai", ".psd", ".cdr"];
+function isEditableMasterFilename(filename) {
+  const lower = String(filename ?? "").trim().toLowerCase();
+  return EDITABLE_MASTER_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+function isTiffFilename(filename) {
+  const lower = String(filename ?? "").trim().toLowerCase();
+  return lower.endsWith(".tif") || lower.endsWith(".tiff");
+}
+function resolveBulkTiffMapping(params) {
+  const { filenames, items, explicitMap } = params;
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const mappings = [];
+  const unmapped = [];
+  const errors = [];
+  const usedItemIds = /* @__PURE__ */ new Set();
+  if (explicitMap && explicitMap.length > 0) {
+    const mapByFile = /* @__PURE__ */ new Map();
+    for (const entry of explicitMap) {
+      const key = String(entry.filename ?? "").trim();
+      const itemId = parsePositiveId(entry.item_id);
+      if (key && itemId) mapByFile.set(key, itemId);
+    }
+    for (const filename of filenames) {
+      if (!isTiffFilename(filename)) {
+        errors.push(`File "${filename}" bukan format .tif/.tiff.`);
+        continue;
+      }
+      const itemId = mapByFile.get(filename);
+      if (!itemId) {
+        unmapped.push(filename);
+        continue;
+      }
+      const target = itemById.get(itemId);
+      if (!target) {
+        errors.push(`Item ID ${itemId} untuk file "${filename}" tidak termasuk pada nota ini.`);
+        continue;
+      }
+      if (!target.acc_admin_id) {
+        errors.push(`Item #${itemId} (${target.nama_item || target.product_name || "Item"}) belum di-ACC Admin.`);
+        continue;
+      }
+      if (usedItemIds.has(itemId)) {
+        errors.push(`Item #${itemId} dipetakan ke lebih dari satu file TIFF.`);
+        continue;
+      }
+      usedItemIds.add(itemId);
+      mappings.push({ filename, itemId });
+    }
+  } else {
+    for (const filename of filenames) {
+      if (!isTiffFilename(filename)) {
+        errors.push(`File "${filename}" bukan format .tif/.tiff.`);
+        continue;
+      }
+      let matchedId = null;
+      const itemIdMatch = filename.match(/(?:^|[^a-z0-9])item[-_]?(\d+)(?:[^0-9]|$)/i);
+      if (itemIdMatch) {
+        const candidateId = Number(itemIdMatch[1]);
+        if (itemById.has(candidateId)) matchedId = candidateId;
+      }
+      if (!matchedId) {
+        const prefixIdxMatch = filename.match(/^0*(\d+)[-_.\s]/);
+        if (prefixIdxMatch) {
+          const idx = Number(prefixIdxMatch[1]) - 1;
+          if (idx >= 0 && idx < items.length) {
+            matchedId = items[idx].id;
+          }
+        }
+      }
+      if (!matchedId) {
+        unmapped.push(filename);
+        continue;
+      }
+      const target = itemById.get(matchedId);
+      if (!target.acc_admin_id) {
+        errors.push(`Item #${matchedId} belum di-ACC Admin.`);
+        continue;
+      }
+      if (usedItemIds.has(matchedId)) {
+        errors.push(`Item #${matchedId} cocok ke lebih dari satu file ("${filename}").`);
+        continue;
+      }
+      usedItemIds.add(matchedId);
+      mappings.push({ filename, itemId: matchedId });
+    }
+  }
+  return {
+    ok: unmapped.length === 0 && errors.length === 0 && mappings.length === filenames.length,
+    mappings,
+    unmapped,
+    errors
+  };
+}
+var DEFAULT_TINTA_GALON_ML = 5e3;
+var DEFAULT_ROLL_PER_GALON = 6;
+var DEFAULT_ROLL_AREA_M2 = round2(3.2 * 70);
+function hitungTintaMlPerM2(kapasitasGalonMl = DEFAULT_TINTA_GALON_ML, rollPerGalon = DEFAULT_ROLL_PER_GALON, luasPerRollM2 = DEFAULT_ROLL_AREA_M2) {
+  const totalLuas = Number(rollPerGalon) * Number(luasPerRollM2);
+  if (!(kapasitasGalonMl > 0) || !(totalLuas > 0)) return 0;
+  return round2(kapasitasGalonMl / totalLuas);
+}
+function hitungPemakaianTintaPerWarna(luasCetakM2, warnaList) {
+  const luas = Math.max(0, round2(luasCetakM2));
+  const rincian = warnaList.map((w) => ({
+    tinta_warna_id: w.id,
+    warna: w.warna,
+    jumlah_ml: round2(luas * Math.max(0, Number(w.konsumsi_ml_per_m2 ?? 0)))
+  }));
+  const totalMl = round2(rincian.reduce((sum, r) => sum + r.jumlah_ml, 0));
+  return { rincian, totalMl };
+}
+function hitungPemakaianBahanPrn(params) {
+  const panjang = Math.max(0, round2(params.panjangFileM));
+  const lebar = Math.max(0, round2(params.lebarFileM));
+  const containerW = Math.max(lebar, round2(params.containerWidthM));
+  const luasFileM2 = round2(panjang * lebar);
+  const luasContainerM2 = round2(containerW * panjang);
+  const offL = round2(Number(params.manualOffcutLebarM ?? 0));
+  const offP = round2(Number(params.manualOffcutPanjangM ?? 0));
+  const createsManualOffcut = offL > 0 && offP > 0;
+  const offcutLuasM2 = createsManualOffcut ? round2(offL * offP) : 0;
+  const wosPotongM2 = round2(Math.max(luasContainerM2 - luasFileM2 - offcutLuasM2, 0));
+  return { luasFileM2, luasContainerM2, offcutLuasM2, wosPotongM2, createsManualOffcut };
+}
+function statusSetelahCetak(qtyOrder, totalQtyTercetak) {
+  return Number(totalQtyTercetak) + 1e-3 >= Number(qtyOrder) ? "selesai" : "antrean_cetak";
+}
+function resolveQcStatus(hasil) {
+  if (hasil === "lolos") return "proses_finishing";
+  if (hasil === "cacat") return "cetak_ulang";
+  return null;
+}
+
 // server/store.ts
 var DATA_DIR = path2.resolve(process.cwd(), "data");
 var DB_FILE = path2.join(DATA_DIR, "db.json");
@@ -1025,7 +1856,7 @@ var STANDARD_ROLL_SPECS = {
   "Stiker 1m": { lebar_m: 1, panjang_m: 50 },
   "Stiker 1.5m": { lebar_m: 1.5, panjang_m: 50 }
 };
-function round2(val) {
+function round22(val) {
   return Math.round((val + Number.EPSILON) * 100) / 100;
 }
 var INSENTIF_ROLES = ["desainer", "operator_cetak", "finishing"];
@@ -1046,6 +1877,44 @@ function buildDefaultInsentifRates() {
     updated_by: null
   }));
 }
+function buildDefaultTintaWarna() {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const konsumsi = hitungTintaMlPerM2(DEFAULT_TINTA_GALON_ML, DEFAULT_ROLL_PER_GALON, DEFAULT_ROLL_AREA_M2);
+  return [
+    { id: 1, kode: "TINTA-C", warna: "Cyan", satuan: "ml", stok_ml: 5e3, stok_minimum_ml: 1e3, kapasitas_galon_ml: 5e3, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now },
+    { id: 2, kode: "TINTA-M", warna: "Magenta", satuan: "ml", stok_ml: 5e3, stok_minimum_ml: 1e3, kapasitas_galon_ml: 5e3, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now },
+    { id: 3, kode: "TINTA-Y", warna: "Yellow", satuan: "ml", stok_ml: 5e3, stok_minimum_ml: 1e3, kapasitas_galon_ml: 5e3, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now },
+    { id: 4, kode: "TINTA-K", warna: "Black", satuan: "ml", stok_ml: 5e3, stok_minimum_ml: 1e3, kapasitas_galon_ml: 5e3, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now }
+  ];
+}
+function buildDefaultStokCattoff() {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  return [
+    {
+      id: 1,
+      kode: "CT-MMT280-01",
+      jenis_bahan: "MMT 280",
+      lebar_m: 3.2,
+      panjang_awal_m: 15,
+      panjang_sisa_m: 15,
+      status: "aktif",
+      created_at: now,
+      updated_at: now
+    }
+  ];
+}
+function buildDefaultWhatsappGatewayConfig() {
+  const webhookUrl = String(process.env.WHATSAPP_WEBHOOK_URL ?? "").trim();
+  return {
+    id: 1,
+    webhook_url: webhookUrl.replace(/\/+$/, ""),
+    webhook_token: String(process.env.WHATSAPP_WEBHOOK_TOKEN ?? "").trim(),
+    app_url: String(process.env.APP_URL ?? `http://localhost:${process.env.PORT ?? 3e3}`).trim().replace(/\/+$/, ""),
+    aktif: Boolean(webhookUrl),
+    updated_at: null,
+    updated_by: null
+  };
+}
 function priceForCategory(product, category) {
   switch (category) {
     case "reseller":
@@ -1063,12 +1932,12 @@ function computeUkuranKotor(lebar_m, tinggi_m, qty, finishing) {
   const ekstraKanan = finishing?.ekstra_kanan_cm ?? 0;
   const ekstraAtas = finishing?.ekstra_atas_cm ?? 0;
   const ekstraBawah = finishing?.ekstra_bawah_cm ?? 0;
-  const lebar = round2(lebar_m + (ekstraKiri + ekstraKanan) / 100);
-  const tinggi = round2(tinggi_m + (ekstraAtas + ekstraBawah) / 100);
+  const lebar = round22(lebar_m + (ekstraKiri + ekstraKanan) / 100);
+  const tinggi = round22(tinggi_m + (ekstraAtas + ekstraBawah) / 100);
   return {
     lebar,
     tinggi,
-    luas: round2(lebar * tinggi * qty)
+    luas: round22(lebar * tinggi * qty)
   };
 }
 function isoOffsetDays(days, hour = 9) {
@@ -1090,16 +1959,64 @@ function notaDateStr(daysOffset = 0) {
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}${m}${day}`;
 }
-function createInitialSeed() {
-  const defaultPwd = hashPassword("password123");
-  const users = [
-    { id: 1, name: "Rina", email: "admin@reffoprint.id", role: "admin", password: defaultPwd },
-    { id: 2, name: "Budi", email: "desainer@reffoprint.id", role: "desainer", password: defaultPwd },
-    { id: 3, name: "Agus", email: "operator@reffoprint.id", role: "operator_cetak", password: defaultPwd },
-    { id: 4, name: "Dedi", email: "finishing@reffoprint.id", role: "finishing", password: defaultPwd },
-    { id: 5, name: "Eko", email: "advertising@reffoprint.id", role: "advertising", password: defaultPwd },
-    { id: 6, name: "Pak Hendra", email: "owner@reffoprint.id", role: "owner", password: defaultPwd }
-  ];
+function generateSeedPassword() {
+  return crypto2.randomBytes(12).toString("base64url");
+}
+var seedCredentialsWritten = false;
+function writeSeedCredentials(rows) {
+  if (seedCredentialsWritten || rows.length === 0) return;
+  seedCredentialsWritten = true;
+  const file = path2.join(DATA_DIR, "initial-credentials.txt");
+  const body = [
+    "# Kredensial awal Reffo PrintFlow (HAPUS setelah semua password diganti)",
+    `# Dibuat: ${(/* @__PURE__ */ new Date()).toISOString()}`,
+    ...rows.map((r) => `${r.role}	${r.email}	${r.password}`),
+    ""
+  ].join("\n");
+  fs2.writeFileSync(file, body, { encoding: "utf-8", mode: 384 });
+  console.warn(`[security] Password seed acak ditulis ke ${file}. Ganti password lalu hapus file ini.`);
+}
+function writePasswordResetReport(rows) {
+  if (rows.length === 0) return;
+  const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+  const file = path2.join(DATA_DIR, `credentials-reset-${stamp}.txt`);
+  const body = [
+    "# Password default lama terdeteksi dan sudah direset otomatis.",
+    "# Simpan file ini sementara, login, ganti password, lalu hapus file.",
+    ...rows.map((r) => `${r.email}	${r.password}`),
+    ""
+  ].join("\n");
+  fs2.writeFileSync(file, body, { encoding: "utf-8", mode: 384 });
+  console.warn(`[security] ${rows.length} akun memakai password default. Password baru ditulis ke ${file}.`);
+}
+function backupDatabaseFile(reason) {
+  if (!fs2.existsSync(DB_FILE)) return null;
+  const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+  const backupDir = path2.join(DATA_DIR, "backups");
+  fs2.mkdirSync(backupDir, { recursive: true });
+  const target = path2.join(backupDir, `db-${reason}-${stamp}.json`);
+  fs2.copyFileSync(DB_FILE, target);
+  console.warn(`[backup] db.json disalin ke ${target}`);
+  return target;
+}
+function createInitialSeed(writeCredentials = true) {
+  const credentials = [
+    { id: 1, name: "Rina", email: "admin@reffoprint.id", role: "admin" },
+    { id: 2, name: "Budi", email: "desainer@reffoprint.id", role: "desainer" },
+    { id: 3, name: "Agus", email: "operator@reffoprint.id", role: "operator_cetak" },
+    { id: 4, name: "Dedi", email: "finishing@reffoprint.id", role: "finishing" },
+    { id: 5, name: "Eko", email: "advertising@reffoprint.id", role: "advertising" },
+    { id: 6, name: "Pak Hendra", email: "owner@reffoprint.id", role: "owner" }
+  ].map((row) => ({ ...row, password: generateSeedPassword() }));
+  if (writeCredentials) writeSeedCredentials(credentials);
+  const users = credentials.map((row) => ({
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    password: hashPassword(row.password),
+    active: true
+  }));
   const instansis = [
     { id: 1, nama_instansi: "Perorangan" },
     { id: 2, nama_instansi: "Dinas Kebudayaan & Pariwisata" },
@@ -1529,6 +2446,8 @@ function createInitialSeed() {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(1, 17),
@@ -1558,6 +2477,8 @@ function createInitialSeed() {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(1, 12),
@@ -1587,6 +2508,8 @@ function createInitialSeed() {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(2, 16),
@@ -1616,6 +2539,8 @@ function createInitialSeed() {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(0, 17),
@@ -1645,6 +2570,8 @@ function createInitialSeed() {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(2, 15),
@@ -1674,6 +2601,8 @@ function createInitialSeed() {
       tanda_tangan_pengambil: null,
       nama_pengambil: "Bagus (Kurir PT Graha)",
       no_wa_pengambil: "081345670000",
+      kurir_nama: "Kurir PT Graha",
+      resi_pengiriman: null,
       waktu_serah_terima: isoOffsetDays(-3, 16),
       catatan_pengecualian: null,
       deadline: isoOffsetDays(-3, 17),
@@ -2180,6 +3109,11 @@ function createInitialSeed() {
     finishings,
     material_rolls,
     material_offcuts,
+    stok_cattoff: buildDefaultStokCattoff(),
+    tinta_warna: buildDefaultTintaWarna(),
+    pemakaian_tinta: [],
+    cetak_grup: [],
+    cetak_grup_item: [],
     machines,
     supplies,
     supply_usages: [],
@@ -2197,15 +3131,23 @@ function createInitialSeed() {
     goods_receipts: [],
     supplier_payments: [],
     whatsapp_outbox: [],
+    whatsapp_gateway_config: buildDefaultWhatsappGatewayConfig(),
+    tax_settings: buildDefaultTaxSettings(),
     audit_logs: [],
     insentif_rates: buildDefaultInsentifRates(),
     counters: {
+      users: 6,
       instansis: 5,
       customers: 5,
       products: 13,
       finishings: 7,
       material_rolls: 7,
       material_offcuts: 2,
+      stok_cattoff: 1,
+      tinta_warna: 4,
+      pemakaian_tinta: 0,
+      cetak_grup: 0,
+      cetak_grup_item: 0,
       machines: 4,
       supplies: 7,
       supply_usages: 0,
@@ -2230,6 +3172,7 @@ function createInitialSeed() {
 }
 var Store = class {
   constructor() {
+    this.criticalDepth = 0;
     if (!fs2.existsSync(DATA_DIR)) {
       fs2.mkdirSync(DATA_DIR, { recursive: true });
     }
@@ -2238,7 +3181,17 @@ var Store = class {
         const raw = fs2.readFileSync(DB_FILE, "utf-8");
         this.state = JSON.parse(raw);
         this.migrateInMemory();
-      } catch {
+      } catch (err) {
+        const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+        const corruptFile = `${DB_FILE}.corrupt-${stamp}`;
+        try {
+          fs2.copyFileSync(DB_FILE, corruptFile);
+        } catch (copyErr) {
+          console.error("[backup] Gagal menyalin db.json rusak:", copyErr);
+        }
+        console.error(
+          `[store] db.json tidak dapat dibaca (${err.message}). File asli disimpan sebagai ${corruptFile}. Data seed baru dibuat.`
+        );
         this.state = createInitialSeed();
         this.persist();
       }
@@ -2264,6 +3217,62 @@ var Store = class {
       this.state.counters.audit_logs = 0;
       changed = true;
     }
+    const waDefault = buildDefaultWhatsappGatewayConfig();
+    const waConfig = this.state.whatsapp_gateway_config;
+    if (!waConfig || typeof waConfig !== "object") {
+      this.state.whatsapp_gateway_config = waDefault;
+      changed = true;
+    } else {
+      if (!Number.isFinite(Number(waConfig.id))) {
+        waConfig.id = 1;
+        changed = true;
+      }
+      if (waConfig.webhook_url === void 0 || waConfig.webhook_url === null) {
+        waConfig.webhook_url = waDefault.webhook_url;
+        changed = true;
+      }
+      if (waConfig.webhook_token === void 0 || waConfig.webhook_token === null) {
+        waConfig.webhook_token = waDefault.webhook_token;
+        changed = true;
+      }
+      if (waConfig.app_url === void 0 || waConfig.app_url === null) {
+        waConfig.app_url = waDefault.app_url;
+        changed = true;
+      }
+      if (waConfig.aktif === void 0 || waConfig.aktif === null) {
+        waConfig.aktif = waDefault.aktif;
+        changed = true;
+      }
+      if (waConfig.updated_at === void 0) {
+        waConfig.updated_at = null;
+        changed = true;
+      }
+      if (waConfig.updated_by === void 0) {
+        waConfig.updated_by = null;
+        changed = true;
+      }
+    }
+    if (!this.state.tax_settings) {
+      this.state.tax_settings = buildDefaultTaxSettings();
+      changed = true;
+    }
+    if (!Array.isArray(this.state.stok_cattoff) || this.state.stok_cattoff.length === 0) {
+      this.state.stok_cattoff = buildDefaultStokCattoff();
+      this.state.counters.stok_cattoff = this.state.stok_cattoff.length;
+      changed = true;
+    }
+    if (!Array.isArray(this.state.tinta_warna) || this.state.tinta_warna.length === 0) {
+      this.state.tinta_warna = buildDefaultTintaWarna();
+      this.state.counters.tinta_warna = this.state.tinta_warna.length;
+      changed = true;
+    }
+    for (const key of ["pemakaian_tinta", "cetak_grup", "cetak_grup_item"]) {
+      if (!Array.isArray(this.state[key])) {
+        this.state[key] = [];
+        this.state.counters[key] = 0;
+        changed = true;
+      }
+    }
     const defaultRates = buildDefaultInsentifRates();
     if (!Array.isArray(this.state.insentif_rates)) {
       this.state.insentif_rates = defaultRates;
@@ -2283,7 +3292,7 @@ var Store = class {
           existing.nominal = def.nominal;
           changed = true;
         } else {
-          existing.nominal = round2(Number(existing.nominal));
+          existing.nominal = round22(Number(existing.nominal));
         }
         if (existing.updated_at === void 0) {
           existing.updated_at = null;
@@ -2296,7 +3305,7 @@ var Store = class {
       }
     }
     const needsMasterSeed = !Array.isArray(this.state.machines) || this.state.machines.length === 0 || !Array.isArray(this.state.supplies) || this.state.supplies.length === 0 || !Array.isArray(this.state.suppliers) || this.state.suppliers.length === 0;
-    const seed = needsMasterSeed ? createInitialSeed() : null;
+    const seed = needsMasterSeed ? createInitialSeed(false) : null;
     if (seed) {
       if (!Array.isArray(this.state.machines) || this.state.machines.length === 0) {
         this.state.machines = seed.machines;
@@ -2337,16 +3346,37 @@ var Store = class {
         changed = true;
       }
     }
+    const resetPasswords = [];
     for (const u of this.state.users) {
       if (!u.password.startsWith("scrypt:")) {
-        u.password = hashPassword(u.password);
+        if (u.password === "password123") {
+          const replacement = generateSeedPassword();
+          resetPasswords.push({ email: u.email, password: replacement });
+          u.password = hashPassword(replacement);
+        } else {
+          u.password = hashPassword(u.password);
+        }
         changed = true;
+      } else {
+        let isDefault = false;
+        try {
+          isDefault = verifyPassword("password123", u.password);
+        } catch {
+          isDefault = false;
+        }
+        if (isDefault) {
+          const replacement = generateSeedPassword();
+          resetPasswords.push({ email: u.email, password: replacement });
+          u.password = hashPassword(replacement);
+          changed = true;
+        }
       }
       if (typeof u.active !== "boolean") {
         u.active = true;
         changed = true;
       }
     }
+    writePasswordResetReport(resetPasswords);
     for (const inst of this.state.instansis) {
       if (inst.npwp === void 0) {
         inst.npwp = null;
@@ -2402,6 +3432,18 @@ var Store = class {
         order.tanda_tangan_pengambil = null;
         changed = true;
       }
+      if (order.kurir_nama === void 0) {
+        order.kurir_nama = null;
+        changed = true;
+      }
+      if (order.resi_pengiriman === void 0) {
+        order.resi_pengiriman = null;
+        changed = true;
+      }
+      if (order.biaya_desain === void 0) {
+        order.biaya_desain = 0;
+        changed = true;
+      }
     }
     for (const item of this.state.order_items) {
       if (item.diskon_persen === void 0) {
@@ -2437,6 +3479,13 @@ var Store = class {
         item.ukuran_lembar = product?.ukuran_lembar ?? null;
         changed = true;
       }
+      if (item.preflight_dpi_ok === void 0) {
+        item.preflight_dpi_ok = null;
+        item.preflight_cmyk_ok = null;
+        item.preflight_bleed_ok = null;
+        item.preflight_catatan = null;
+        changed = true;
+      }
     }
     for (const payment of this.state.order_payments) {
       if (payment.shift_id === void 0) {
@@ -2444,9 +3493,14 @@ var Store = class {
         changed = true;
       }
     }
-    for (const key of ["suppliers", "purchase_orders", "goods_receipts", "supplier_payments", "whatsapp_outbox", "insentif_rates"]) {
-      const rows = this.state[key];
-      this.state.counters[key] = Math.max(this.state.counters[key] ?? 0, ...rows.map((r) => r.id));
+    for (const [key, value] of Object.entries(this.state)) {
+      if (!Array.isArray(value)) continue;
+      const rows = value;
+      const maxId = rows.reduce(
+        (max, row) => Math.max(max, Number.isFinite(Number(row?.id)) ? Number(row?.id) : 0),
+        0
+      );
+      this.state.counters[key] = Math.max(this.state.counters[key] ?? 0, maxId);
     }
     if (changed) {
       this.persist();
@@ -2454,8 +3508,7 @@ var Store = class {
   }
   async init() {
     if (mysqlAdapter.isEnabled()) {
-      const seed = createInitialSeed();
-      this.state = await mysqlAdapter.initialize(seed);
+      this.state = await mysqlAdapter.initialize(() => createInitialSeed(true));
       this.migrateInMemory();
       console.log("Reffo PrintFlow terhubung ke MySQL localhost.");
     }
@@ -2471,6 +3524,7 @@ var Store = class {
   }
   persist() {
     if (mysqlAdapter.isEnabled()) {
+      if (this.criticalDepth > 0) return;
       mysqlAdapter.queuePersist(this.state);
       return;
     }
@@ -2478,7 +3532,34 @@ var Store = class {
     fs2.writeFileSync(tmpFile, JSON.stringify(this.state, null, 2), "utf-8");
     fs2.renameSync(tmpFile, DB_FILE);
   }
+  /**
+   * Jalankan mutasi stok/transaksi kritis dengan lock baris MySQL
+   * (SELECT ... FOR UPDATE) dan persist CRUD per entitas dalam satu transaksi.
+   * Bila gagal, state di memori dikembalikan ke snapshot sebelumnya.
+   */
+  async critical(tables, fn) {
+    if (!mysqlAdapter.isEnabled()) {
+      const snapshot2 = JSON.parse(JSON.stringify(this.state));
+      try {
+        return await fn();
+      } catch (err) {
+        this.state = snapshot2;
+        throw err;
+      }
+    }
+    const snapshot = JSON.parse(JSON.stringify(this.state));
+    this.criticalDepth += 1;
+    try {
+      return await mysqlAdapter.runLocked(() => this.state, tables, fn);
+    } catch (err) {
+      this.state = snapshot;
+      throw err;
+    } finally {
+      this.criticalDepth -= 1;
+    }
+  }
   resetSeed() {
+    backupDatabaseFile("pre-reset");
     this.state = createInitialSeed();
     this.persist();
   }
@@ -2561,7 +3642,7 @@ var Store = class {
       customer,
       admin_name: admin?.name ?? "Admin",
       designer_name: designer?.name ?? null,
-      sisa_tagihan: statusNota === "batal" ? 0 : round2(Math.max(raw.total_tagihan - raw.jumlah_dp, 0)),
+      sisa_tagihan: statusNota === "batal" ? 0 : round22(Math.max(raw.total_tagihan - raw.jumlah_dp, 0)),
       items,
       design_revisions: revisions,
       advertising_spks: spks,
@@ -2590,20 +3671,108 @@ var Store = class {
 };
 var store = new Store();
 
+// server/security.ts
+var MIN_SESSION_SECRET_LENGTH = 32;
+var PLACEHOLDER_SECRETS = /* @__PURE__ */ new Set([
+  "change-this-secret-in-production",
+  "change-me",
+  "secret",
+  "password",
+  "password123",
+  "my_secret",
+  "my-secret",
+  "reffo"
+]);
+function isProduction(env) {
+  return String(env.NODE_ENV ?? "").toLowerCase() === "production";
+}
+function filled(value) {
+  return String(value ?? "").trim();
+}
+function validateSecurityEnv(env = process.env) {
+  const errors = [];
+  const warnings = [];
+  const production = isProduction(env);
+  const sessionSecret = filled(env.SESSION_SECRET);
+  if (!sessionSecret) {
+    (production ? errors : warnings).push(
+      "SESSION_SECRET belum diisi. Di produksi server menolak berjalan tanpa secret acak."
+    );
+  } else if (sessionSecret.length < MIN_SESSION_SECRET_LENGTH) {
+    (production ? errors : warnings).push(
+      `SESSION_SECRET terlalu pendek (${sessionSecret.length} karakter). Gunakan minimal ${MIN_SESSION_SECRET_LENGTH} karakter acak.`
+    );
+  } else if (PLACEHOLDER_SECRETS.has(sessionSecret.toLowerCase())) {
+    (production ? errors : warnings).push(
+      "SESSION_SECRET masih memakai nilai contoh. Ganti dengan string acak sebelum go-live."
+    );
+  }
+  const waToken = filled(env.WHATSAPP_WEBHOOK_TOKEN);
+  const bridgeToken = filled(env.WA_BRIDGE_TOKEN);
+  if (!waToken) {
+    (production ? errors : warnings).push(
+      "WHATSAPP_WEBHOOK_TOKEN kosong. Bridge WhatsApp akan menolak start agar endpoint /send tidak terbuka."
+    );
+  }
+  if (!bridgeToken) {
+    (production ? errors : warnings).push(
+      "WA_BRIDGE_TOKEN kosong. Isi token yang sama dengan WHATSAPP_WEBHOOK_TOKEN agar bridge aman."
+    );
+  }
+  if (waToken && bridgeToken && waToken !== bridgeToken) {
+    warnings.push(
+      "WA_BRIDGE_TOKEN berbeda dengan WHATSAPP_WEBHOOK_TOKEN. Bridge memakai WA_BRIDGE_TOKEN; pastikan keduanya sama."
+    );
+  }
+  const demoSwitch = String(env.ENABLE_DEMO_SWITCH ?? "false").trim().toLowerCase();
+  if (production && demoSwitch !== "false") {
+    errors.push(
+      'ENABLE_DEMO_SWITCH harus "false" di produksi agar login cepat divisi tanpa kata sandi tidak aktif.'
+    );
+  }
+  return { errors, warnings };
+}
+function assertSecurityEnv(env = process.env) {
+  const { errors, warnings } = validateSecurityEnv(env);
+  for (const warning of warnings) {
+    console.warn(`[security] ${warning}`);
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `Konfigurasi keamanan belum aman untuk produksi:
+- ${errors.join("\n- ")}
+Perbaiki .env lalu jalankan ulang server.`
+    );
+  }
+}
+
+// server/uploads.ts
+import path3 from "node:path";
+function safeUploadFilename(value) {
+  const name = path3.basename(value);
+  if (!name || name === "." || name === "..") return null;
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) return null;
+  return name;
+}
+function toPublicPreviewUrl(stored, token) {
+  if (!stored) return null;
+  if (!stored.startsWith("/uploads/")) return stored;
+  const name = safeUploadFilename(stored.slice("/uploads/".length));
+  return name ? `/api/public/approval/${encodeURIComponent(token)}/file/${encodeURIComponent(name)}` : null;
+}
+
 // server.ts
 var PORT = Number(process.env.PORT ?? 3e3);
 var SESSION_COOKIE = "reffo_session";
-var UPLOADS_DIR = path3.resolve(process.cwd(), "uploads");
+var UPLOADS_DIR = path4.resolve(process.cwd(), "uploads");
 var MAX_UPLOAD_MB = Math.max(1, Number(process.env.MAX_UPLOAD_MB ?? 20));
-var WHATSAPP_WEBHOOK_URL = String(process.env.WHATSAPP_WEBHOOK_URL ?? "").trim();
-var WHATSAPP_WEBHOOK_TOKEN = String(process.env.WHATSAPP_WEBHOOK_TOKEN ?? "").trim();
 var AUTO_CLEAN_TIFF_HARI = Math.max(1, Number(process.env.AUTO_CLEAN_TIFF_HARI ?? 90));
 var PAJAK_REKLAME_HARI = Math.min(365, Math.max(0, Number(process.env.PAJAK_REKLAME_HARI ?? 30)));
 if (!fs3.existsSync(UPLOADS_DIR)) {
   fs3.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 function demoSwitchEnabled() {
-  return (process.env.ENABLE_DEMO_SWITCH ?? "true").trim().toLowerCase() !== "false";
+  return (process.env.ENABLE_DEMO_SWITCH ?? "false").trim().toLowerCase() === "true";
 }
 var ALLOWED_UPLOAD_EXTENSIONS = /* @__PURE__ */ new Set([
   ".jpg",
@@ -2620,19 +3789,20 @@ var ALLOWED_UPLOAD_EXTENSIONS = /* @__PURE__ */ new Set([
   ".zip",
   ".rar"
 ]);
+var uploadStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+  filename: (_req, file, cb) => {
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    cb(null, `${Date.now()}-${safeName}`);
+  }
+});
 var upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-    filename: (_req, file, cb) => {
-      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-      cb(null, `${Date.now()}-${safeName}`);
-    }
-  }),
+  storage: uploadStorage,
   limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => {
-    const ext = path3.extname(file.originalname).toLowerCase();
+    const ext = path4.extname(file.originalname).toLowerCase();
     const mime = (file.mimetype ?? "").toLowerCase();
-    const mimeOk = mime.startsWith("image/") || [
+    const mimeOk = mime === "" || mime.startsWith("image/") || [
       "application/pdf",
       "application/postscript",
       "application/illustrator",
@@ -2642,7 +3812,8 @@ var upload = multer({
       "application/x-rar-compressed",
       "application/vnd.rar",
       "application/octet-stream",
-      "application/x-coreldraw"
+      "application/x-coreldraw",
+      "application/vnd.corel-draw"
     ].includes(mime);
     if (!ALLOWED_UPLOAD_EXTENSIONS.has(ext) || !mimeOk) {
       cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", file.fieldname));
@@ -2651,6 +3822,40 @@ var upload = multer({
     cb(null, true);
   }
 });
+var uploadPhoto = multer({
+  storage: uploadStorage,
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path4.extname(file.originalname).toLowerCase();
+    const mime = (file.mimetype ?? "").toLowerCase();
+    if (![".jpg", ".jpeg", ".png", ".webp"].includes(ext) || !mime.startsWith("image/")) {
+      cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", file.fieldname));
+      return;
+    }
+    cb(null, true);
+  }
+});
+var uploadBulkTiff = multer({
+  storage: uploadStorage,
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 30 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path4.extname(file.originalname).toLowerCase();
+    if (ext !== ".tif" && ext !== ".tiff") {
+      cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", file.fieldname));
+      return;
+    }
+    cb(null, true);
+  }
+});
+function cleanupUploadedFiles(files) {
+  for (const f of files ?? []) {
+    if (!f?.path) continue;
+    try {
+      if (fs3.existsSync(f.path)) fs3.unlinkSync(f.path);
+    } catch {
+    }
+  }
+}
 var sseClients = /* @__PURE__ */ new Set();
 function broadcastEvent(type, detail = {}) {
   if (sseClients.size === 0) return;
@@ -2680,15 +3885,15 @@ function extractToken(req) {
     if (bearer) return bearer;
   }
   const cookieToken = parseCookie(req.header("cookie"), SESSION_COOKIE);
-  if (cookieToken) return cookieToken;
-  const queryToken = typeof req.query.token === "string" ? req.query.token.trim() : "";
-  return queryToken || null;
+  return cookieToken || null;
 }
 function getActiveUser(req) {
   const token = extractToken(req);
   const payload = verifySessionToken(token);
   if (!payload) return null;
-  return store.getState().users.find((u) => u.id === payload.uid) ?? null;
+  const user = store.getState().users.find((u) => u.id === payload.uid) ?? null;
+  if (!user || user.active === false) return null;
+  return user;
 }
 function setSessionCookie(res, token) {
   res.setHeader(
@@ -2722,6 +3927,35 @@ function clientIp(req) {
   if (forwarded) return forwarded.split(",")[0]?.trim() ?? null;
   return req.socket?.remoteAddress ?? null;
 }
+async function runTransactional(res, work, errorMessage) {
+  const capture = { value: null };
+  const originalStatus = res.status.bind(res);
+  const originalJson = res.json.bind(res);
+  res.status = ((code) => {
+    capture.value = { status: code, body: capture.value?.body };
+    return res;
+  });
+  res.json = ((body) => {
+    capture.value = { status: capture.value?.status ?? 200, body };
+    return res;
+  });
+  try {
+    await work();
+  } catch (err) {
+    console.error("[transaction]", err);
+    res.status = originalStatus;
+    res.json = originalJson;
+    if (!res.headersSent) {
+      originalStatus(500).json({ error: errorMessage });
+    }
+    return;
+  }
+  res.status = originalStatus;
+  res.json = originalJson;
+  if (capture.value) {
+    originalStatus(capture.value.status).json(capture.value.body);
+  }
+}
 function recordAudit(user, action, entity, entityId, detail, ip = null) {
   const db = store.getState();
   const log = {
@@ -2746,8 +3980,32 @@ function auditRequest(req, action, entity, entityId, detail) {
   const current = req.currentUser ?? null;
   return recordAudit(current, action, entity, entityId, detail, clientIp(req));
 }
+function getWaConfig() {
+  const config = store.getState().whatsapp_gateway_config;
+  const fallbackUrl = String(process.env.WHATSAPP_WEBHOOK_URL ?? "").trim();
+  const rawUrl = config?.webhook_url ?? fallbackUrl;
+  return {
+    url: String(rawUrl).trim().replace(/\/+$/, ""),
+    token: String(config?.webhook_token ?? process.env.WHATSAPP_WEBHOOK_TOKEN ?? "").trim(),
+    appUrl: String(config?.app_url ?? process.env.APP_URL ?? `http://localhost:${PORT}`).trim().replace(/\/+$/, ""),
+    aktif: config?.aktif ?? Boolean(rawUrl)
+  };
+}
 function appBaseUrl() {
-  return String(process.env.APP_URL ?? `http://localhost:${PORT}`).replace(/\/+$/, "");
+  return getWaConfig().appUrl;
+}
+function normalizeGatewayUrl(value, label) {
+  const raw = String(value ?? "").trim().replace(/\/+$/, "");
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("Protokol harus http atau https.");
+    }
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    throw new Error(`${label} harus berupa URL http/https yang valid.`);
+  }
 }
 function normalizeWaNumber(value) {
   const digits = String(value ?? "").replace(/\D/g, "");
@@ -2757,11 +4015,12 @@ function normalizeWaNumber(value) {
   if (digits.startsWith("8")) return `62${digits}`;
   return digits;
 }
-function enqueueWa(event, dedupeKey, noWa, pesan, orderId = null, link = null) {
+function enqueueWa(event, dedupeKey, noWa, pesan, orderId = null, link = null, mediaPath = null) {
   const db = store.getState();
   const nomor = normalizeWaNumber(noWa);
   if (!nomor || db.whatsapp_outbox.some((w) => w.dedupe_key === dedupeKey)) return null;
   const now = (/* @__PURE__ */ new Date()).toISOString();
+  const waConfig = getWaConfig();
   const row = {
     id: store.nextId("whatsapp_outbox"),
     event,
@@ -2770,9 +4029,10 @@ function enqueueWa(event, dedupeKey, noWa, pesan, orderId = null, link = null) {
     no_wa: nomor,
     pesan,
     link,
+    media_path: mediaPath,
     status: "pending",
     attempts: 0,
-    last_error: WHATSAPP_WEBHOOK_URL ? null : "Gateway WhatsApp belum dikonfigurasi (WHATSAPP_WEBHOOK_URL).",
+    last_error: waConfig.aktif && waConfig.url ? null : "Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan.",
     next_attempt_at: null,
     created_at: now,
     updated_at: now,
@@ -2808,10 +4068,11 @@ async function deliverWaOutbox() {
       (w) => w.status === "pending" && (!w.next_attempt_at || new Date(w.next_attempt_at).getTime() <= now)
     );
     if (pending.length === 0) return;
+    const waConfig = getWaConfig();
     let changed = false;
     for (const w of pending) {
-      if (!WHATSAPP_WEBHOOK_URL) {
-        const error = "Gateway WhatsApp belum dikonfigurasi (WHATSAPP_WEBHOOK_URL).";
+      if (!waConfig.aktif || !waConfig.url) {
+        const error = "Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan.";
         if (w.last_error !== error) {
           w.last_error = error;
           w.updated_at = (/* @__PURE__ */ new Date()).toISOString();
@@ -2820,17 +4081,18 @@ async function deliverWaOutbox() {
         continue;
       }
       try {
-        const response = await fetch(WHATSAPP_WEBHOOK_URL, {
+        const response = await fetch(waConfig.url, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            ...WHATSAPP_WEBHOOK_TOKEN ? { Authorization: `Bearer ${WHATSAPP_WEBHOOK_TOKEN}` } : {}
+            ...waConfig.token ? { Authorization: `Bearer ${waConfig.token}` } : {}
           },
           body: JSON.stringify({
             event: w.event,
             to: w.no_wa,
             message: w.pesan,
             link: w.link,
+            media_path: w.media_path ?? null,
             dedupe_key: w.dedupe_key
           })
         });
@@ -2868,8 +4130,8 @@ function hapusTiffLama(hari, pelaku, keringanan) {
     const order = db.orders.find((o) => o.id === item.order_id);
     if (!order || !activeOrderRaw(order) || !order.waktu_serah_terima) continue;
     if (new Date(order.waktu_serah_terima).getTime() > batas) continue;
-    const namaFile = path3.basename(item.file_cetak_tiff);
-    const target = path3.join(UPLOADS_DIR, namaFile);
+    const namaFile = path4.basename(item.file_cetak_tiff);
+    const target = path4.join(UPLOADS_DIR, namaFile);
     let aman = false;
     try {
       aman = fs3.statSync(target).isFile();
@@ -2902,28 +4164,54 @@ function hapusTiffLama(hari, pelaku, keringanan) {
   }
   return hasil;
 }
-function clampPercent(value) {
+function clampPercent2(value) {
   const num = Number(value ?? 0);
   if (!Number.isFinite(num)) return 0;
-  return Math.min(Math.max(round2(num), 0), 100);
+  return Math.min(Math.max(round22(num), 0), 100);
 }
 function generateApprovalToken() {
-  return crypto2.randomBytes(18).toString("hex");
+  return crypto3.randomBytes(18).toString("hex");
 }
 function getOpenShiftFor(kasirId) {
   const db = store.getState();
   return db.shifts.find((s) => s.kasir_id === kasirId && s.status === "buka") ?? null;
 }
+function ensureAdminOpenShift(user, ip) {
+  if (user.role !== "admin") return null;
+  const existing = getOpenShiftFor(user.id);
+  if (existing) return existing;
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const shift = {
+    id: store.nextId("shifts"),
+    kasir_id: user.id,
+    opened_at: now,
+    closed_at: null,
+    opening_cash: 0,
+    expected_tunai: 0,
+    expected_transfer: 0,
+    expected_qris: 0,
+    actual_tunai: 0,
+    actual_transfer: 0,
+    actual_qris: 0,
+    selisih: 0,
+    catatan: "Dibuka otomatis saat login admin",
+    status: "buka"
+  };
+  store.getState().shifts.push(shift);
+  recordAudit(user, "shift_auto_open", "shift", shift.id, "Shift dibuka otomatis saat Admin login", ip);
+  broadcastEvent("shift_updated", { shiftId: shift.id });
+  return shift;
+}
 function computeShiftExpectation(shift) {
   const db = store.getState();
   const payments = db.order_payments.filter((p) => p.shift_id === shift.id);
-  const tunai = round2(
+  const tunai = round22(
     shift.opening_cash + payments.filter((p) => p.metode === "Tunai").reduce((s, p) => s + p.nominal, 0)
   );
-  const transfer = round2(
+  const transfer = round22(
     payments.filter((p) => p.metode === "Transfer").reduce((s, p) => s + p.nominal, 0)
   );
-  const qris = round2(
+  const qris = round22(
     payments.filter((p) => p.metode === "QRIS").reduce((s, p) => s + p.nominal, 0)
   );
   return { tunai, transfer, qris };
@@ -2960,8 +4248,8 @@ function hitungInsentif(db, dari, sampai) {
       total_item: 0,
       item_selesai: 0,
       job_selesai: 0,
-      tarif_item: round2(tarif(role, "per_item")),
-      tarif_job: round2(tarif(role, "per_job")),
+      tarif_item: round22(tarif(role, "per_item")),
+      tarif_job: round22(tarif(role, "per_job")),
       insentif_item: 0,
       insentif_job: 0,
       total_insentif: 0
@@ -2986,9 +4274,9 @@ function hitungInsentif(db, dari, sampai) {
   }
   for (const row of staf) {
     row.job_selesai = selesaiPerStaf.get(row.user_id)?.size ?? 0;
-    row.insentif_item = round2(row.item_selesai * row.tarif_item);
-    row.insentif_job = round2(row.job_selesai * row.tarif_job);
-    row.total_insentif = round2(row.insentif_item + row.insentif_job);
+    row.insentif_item = round22(row.item_selesai * row.tarif_item);
+    row.insentif_job = round22(row.job_selesai * row.tarif_job);
+    row.total_insentif = round22(row.insentif_item + row.insentif_job);
   }
   staf.sort((a, b) => b.total_insentif - a.total_insentif || a.nama.localeCompare(b.nama));
   return {
@@ -2998,10 +4286,10 @@ function hitungInsentif(db, dari, sampai) {
     staf,
     ringkasan: {
       jumlah_staf: stafMap.size,
-      total_item: round2(staf.reduce((s, row) => s + row.total_item, 0)),
-      total_item_selesai: round2(staf.reduce((s, row) => s + row.item_selesai, 0)),
-      total_job_selesai: round2(staf.reduce((s, row) => s + row.job_selesai, 0)),
-      total_insentif: round2(staf.reduce((s, row) => s + row.total_insentif, 0))
+      total_item: round22(staf.reduce((s, row) => s + row.total_item, 0)),
+      total_item_selesai: round22(staf.reduce((s, row) => s + row.item_selesai, 0)),
+      total_job_selesai: round22(staf.reduce((s, row) => s + row.job_selesai, 0)),
+      total_insentif: round22(staf.reduce((s, row) => s + row.total_insentif, 0))
     }
   };
 }
@@ -3085,12 +4373,12 @@ function hitungProfitabilitas(db, dari, sampai) {
     }
     const klien = klienMap.get(instansiId);
     klien.jumlah_nota += 1;
-    klien.total_tagihan = round2(klien.total_tagihan + order.total_tagihan);
-    klien.piutang = round2(klien.piutang + order.sisa_tagihan);
+    klien.total_tagihan = round22(klien.total_tagihan + order.total_tagihan);
+    klien.piutang = round22(klien.piutang + order.sisa_tagihan);
     for (const item of order.items) {
       const product = db.products.find((p) => p.id === item.product_id);
       const qtyBasis = product?.kategori_produk === "meteran" ? Number(item.luas_tagihan_m2 ?? 0) : Number(item.qty ?? 0);
-      const hpp2 = round2(qtyBasis * Number(product?.harga_modal ?? 0));
+      const hpp2 = round22(qtyBasis * Number(product?.harga_modal ?? 0));
       const productId = product?.id ?? item.product_id;
       if (!produkMap.has(productId)) {
         produkMap.set(productId, {
@@ -3107,24 +4395,24 @@ function hitungProfitabilitas(db, dari, sampai) {
       }
       const produk = produkMap.get(productId);
       produk.jumlah_item += 1;
-      produk.qty = round2(produk.qty + qtyBasis);
-      produk.omzet = round2(produk.omzet + item.subtotal);
-      produk.hpp = round2(produk.hpp + hpp2);
+      produk.qty = round22(produk.qty + qtyBasis);
+      produk.omzet = round22(produk.omzet + item.subtotal);
+      produk.hpp = round22(produk.hpp + hpp2);
       klien.jumlah_item += 1;
-      klien.omzet = round2(klien.omzet + item.subtotal);
-      klien.hpp = round2(klien.hpp + hpp2);
+      klien.omzet = round22(klien.omzet + item.subtotal);
+      klien.hpp = round22(klien.hpp + hpp2);
     }
   }
   const finalisasi = (row) => {
-    row.laba_kotor = round2(row.omzet - row.hpp);
-    row.margin_persen = row.omzet > 0 ? round2(row.laba_kotor / row.omzet * 100) : 0;
+    row.laba_kotor = round22(row.omzet - row.hpp);
+    row.margin_persen = row.omzet > 0 ? round22(row.laba_kotor / row.omzet * 100) : 0;
     return row;
   };
   const perProduk = Array.from(produkMap.values()).map(finalisasi).sort((a, b) => b.laba_kotor - a.laba_kotor || a.nama_produk.localeCompare(b.nama_produk));
   const perKlien = Array.from(klienMap.values()).map(finalisasi).sort((a, b) => b.laba_kotor - a.laba_kotor || a.instansi.localeCompare(b.instansi));
-  const omzet = round2(perProduk.reduce((s, row) => s + row.omzet, 0));
-  const hpp = round2(perProduk.reduce((s, row) => s + row.hpp, 0));
-  const labaKotor = round2(omzet - hpp);
+  const omzet = round22(perProduk.reduce((s, row) => s + row.omzet, 0));
+  const hpp = round22(perProduk.reduce((s, row) => s + row.hpp, 0));
+  const labaKotor = round22(omzet - hpp);
   return {
     dari,
     sampai,
@@ -3134,7 +4422,7 @@ function hitungProfitabilitas(db, dari, sampai) {
       omzet,
       hpp,
       laba_kotor: labaKotor,
-      margin_persen: omzet > 0 ? round2(labaKotor / omzet * 100) : 0
+      margin_persen: omzet > 0 ? round22(labaKotor / omzet * 100) : 0
     },
     per_produk: perProduk,
     per_klien: perKlien
@@ -3154,24 +4442,24 @@ function computeBatchNesting(items, rollWidth) {
   for (const item of items) {
     const kotor = item.ukuran_kotor;
     if (!kotor) continue;
-    widths.push(round2(kotor.lebar));
-    pulls.push(round2(kotor.tinggi * item.qty));
+    widths.push(round22(kotor.lebar));
+    pulls.push(round22(kotor.tinggi * item.qty));
   }
-  const lebarGabungan = round2(widths.reduce((a, b) => a + b, 0));
-  const panjangTarik = round2(Math.max(0, ...pulls));
-  const luasTerpakai = round2(
+  const lebarGabungan = round22(widths.reduce((a, b) => a + b, 0));
+  const panjangTarik = round22(Math.max(0, ...pulls));
+  const luasTerpakai = round22(
     items.reduce((acc, item) => acc + (item.ukuran_kotor?.luas ?? 0) * item.qty, 0)
   );
-  const lebarSisa = rollWidth === null ? null : round2(Math.max(rollWidth - lebarGabungan, 0));
-  const luasWaste = lebarSisa === null ? 0 : round2(lebarSisa * panjangTarik);
-  const penghematanPanjang = round2(pulls.reduce((a, b) => a + b, 0) - panjangTarik);
+  const lebarSisa = rollWidth === null ? null : round22(Math.max(rollWidth - lebarGabungan, 0));
+  const luasWaste = lebarSisa === null ? 0 : round22(lebarSisa * panjangTarik);
+  const penghematanPanjang = round22(pulls.reduce((a, b) => a + b, 0) - panjangTarik);
   return {
     lebar_gabungan_m: lebarGabungan,
     panjang_tarik_m: panjangTarik,
     luas_terpakai_m2: luasTerpakai,
     luas_waste_m2: luasWaste,
     penghematan_panjang_m: penghematanPanjang,
-    penghematan_luas_m2: round2(penghematanPanjang * lebarGabungan),
+    penghematan_luas_m2: round22(penghematanPanjang * lebarGabungan),
     lebar_sisa_m: lebarSisa
   };
 }
@@ -3185,7 +4473,52 @@ function toCsv(headers, rows) {
 function buildApp() {
   const app = express();
   app.use(express.json({ limit: "10mb" }));
-  app.use("/uploads", express.static(UPLOADS_DIR));
+  app.param(["id", "orderId", "itemId"], (_req, res, next, val) => {
+    if (!parsePositiveId(val)) {
+      res.status(422).json({ error: "Parameter ID harus berupa bilangan bulat positif." });
+      return;
+    }
+    next();
+  });
+  app.get("/api/public/approval/:token/file/:filename", (req, res) => {
+    const token = String(req.params.token ?? "").trim();
+    const name = safeUploadFilename(String(req.params.filename ?? ""));
+    const db = store.getState();
+    const order = db.orders.find((row) => row.approval_token && row.approval_token === token);
+    if (!order || !name) {
+      res.status(404).json({ error: "File tidak ditemukan." });
+      return;
+    }
+    const allowed = /* @__PURE__ */ new Set();
+    const add = (stored) => {
+      if (stored?.startsWith("/uploads/")) {
+        const base = safeUploadFilename(stored.slice("/uploads/".length));
+        if (base) allowed.add(base);
+      }
+    };
+    add(order.lampiran_briefing);
+    for (const item of db.order_items.filter((row) => row.order_id === order.id)) {
+      add(item.file_preview_acc);
+    }
+    for (const revision of db.design_revisions.filter((row) => row.order_id === order.id)) {
+      add(revision.file_preview);
+    }
+    for (const payment of db.order_payments.filter((row) => row.order_id === order.id)) {
+      add(payment.bukti_bayar);
+    }
+    if (!allowed.has(name)) {
+      res.status(404).json({ error: "File bukan milik nota ini." });
+      return;
+    }
+    res.sendFile(path4.join(UPLOADS_DIR, name), {
+      headers: { "Cache-Control": "private, max-age=300" }
+    });
+  });
+  app.use(
+    "/uploads",
+    requireAuth(),
+    express.static(UPLOADS_DIR, { index: false, dotfiles: "deny", fallthrough: true })
+  );
   app.get("/api/auth/accounts", (_req, res) => {
     const accounts = demoSwitchEnabled() ? store.getState().users.filter((u) => u.active !== false).map(sanitizeUser) : [];
     res.json({ accounts, demo_switch_enabled: demoSwitchEnabled() });
@@ -3205,9 +4538,10 @@ function buildApp() {
     }
     const token = signSessionToken(user.id, user.role);
     setSessionCookie(res, token);
+    const activeShift = ensureAdminOpenShift(user, clientIp(req));
     recordAudit(user, "login", "auth", user.id, `Login berhasil sebagai ${user.role}`, clientIp(req));
     store.persist();
-    res.json({ user: sanitizeUser(user), token });
+    res.json({ user: sanitizeUser(user), token, shift: activeShift ? hydrateShift(activeShift) : null });
   });
   app.post("/api/auth/switch", (req, res) => {
     if (!demoSwitchEnabled()) {
@@ -3228,9 +4562,10 @@ function buildApp() {
     }
     const token = signSessionToken(user.id, user.role);
     setSessionCookie(res, token);
+    const activeShift = ensureAdminOpenShift(user, clientIp(req));
     recordAudit(user, "login_switch", "auth", user.id, "Login via demo switch", clientIp(req));
     store.persist();
-    res.json({ user: sanitizeUser(user), token });
+    res.json({ user: sanitizeUser(user), token, shift: activeShift ? hydrateShift(activeShift) : null });
   });
   app.post("/api/auth/logout", (_req, res) => {
     clearSessionCookie(res);
@@ -3272,11 +4607,92 @@ data: ${JSON.stringify({ ok: true })}
       customers: db.customers,
       rolls: db.material_rolls,
       offcuts: db.material_offcuts,
+      cattoffs: db.stok_cattoff ?? [],
+      tinta_warna: db.tinta_warna ?? [],
       machines: db.machines ?? [],
       supplies: db.supplies ?? [],
       demo_switch_enabled: demoSwitchEnabled(),
-      shifts
+      shifts,
+      tax_settings: db.tax_settings ?? buildDefaultTaxSettings()
     });
+  });
+  app.get("/api/badges", requireAuth(), (req, res) => {
+    const user = getCurrentUser(req);
+    const db = store.getState();
+    const activeOrders = db.orders.filter(activeOrderRaw);
+    const activeOrderIds = new Set(activeOrders.map((o) => o.id));
+    const designStatuses = /* @__PURE__ */ new Set([
+      "menunggu_desain",
+      "proses_desain",
+      "menunggu_acc",
+      "revisi"
+    ]);
+    const printStatuses = /* @__PURE__ */ new Set([
+      "antrean_cetak",
+      "siap_tata",
+      "proses_cetak",
+      "gagal_cetak",
+      "cetak_ulang"
+    ]);
+    const adminReviews = activeOrders.filter(
+      (o) => db.order_items.some(
+        (i) => i.order_id === o.id && i.status_produksi === "menunggu_acc" && !i.acc_admin_id
+      )
+    ).length;
+    const desainerQueue = activeOrders.filter(
+      (o) => db.order_items.some((i) => i.order_id === o.id && designStatuses.has(i.status_produksi))
+    ).length;
+    const operatorQueue = db.order_items.filter(
+      (i) => activeOrderIds.has(i.order_id) && printStatuses.has(i.status_produksi)
+    ).length;
+    const finishingQueue = db.order_items.filter(
+      (i) => activeOrderIds.has(i.order_id) && (i.status_produksi === "antrean_finishing" || i.status_produksi === "proses_finishing")
+    ).length;
+    const advertisingSpk = db.advertising_spks.filter((s) => s.status_lapangan !== "selesai").length;
+    const serahTerima = activeOrders.map((o) => store.hydrateOrder(o)).filter((o) => store.isOrderSiapDiambil(o)).length;
+    res.json({
+      badges: {
+        admin_reviews: adminReviews,
+        desainer_queue: desainerQueue,
+        operator_queue: operatorQueue,
+        finishing_queue: finishingQueue,
+        advertising_spk: advertisingSpk,
+        serah_terima: serahTerima
+      },
+      shift_aktif: user.role === "admin" ? Boolean(getOpenShiftFor(user.id)) : false
+    });
+  });
+  app.get("/api/settings/tax", requireAuth(), (_req, res) => {
+    const db = store.getState();
+    res.json({ tax_settings: db.tax_settings ?? buildDefaultTaxSettings() });
+  });
+  app.put("/api/owner/settings/tax", requireAuth(["owner"]), (req, res) => {
+    const user = getCurrentUser(req);
+    const db = store.getState();
+    const body = req.body ?? {};
+    const current = db.tax_settings ?? buildDefaultTaxSettings();
+    const mode = body.mode_harga === "sudah_termasuk_ppn" ? "sudah_termasuk_ppn" : "belum_termasuk_ppn";
+    const next = {
+      id: 1,
+      ppn_persen_default: clampPercent2(body.ppn_persen_default ?? current.ppn_persen_default),
+      pph23_persen_default: clampPercent2(body.pph23_persen_default ?? current.pph23_persen_default),
+      mode_harga: mode,
+      ppn_termasuk_diskon: body.ppn_termasuk_diskon !== void 0 ? Boolean(body.ppn_termasuk_diskon) : current.ppn_termasuk_diskon,
+      potong_pph23_otomatis: body.potong_pph23_otomatis !== void 0 ? Boolean(body.potong_pph23_otomatis) : current.potong_pph23_otomatis,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_by: user.id
+    };
+    db.tax_settings = next;
+    auditRequest(
+      req,
+      "tax_settings_update",
+      "settings",
+      1,
+      `Pengaturan pajak diperbarui: PPN ${next.ppn_persen_default}%, PPh23 ${next.pph23_persen_default}%, mode ${next.mode_harga}.`
+    );
+    store.persist();
+    broadcastEvent("settings_updated");
+    res.json({ tax_settings: next });
   });
   app.post("/api/ai/parse-order", requireAuth(["admin"]), async (req, res) => {
     const { text } = req.body;
@@ -3363,10 +4779,10 @@ ${text}`,
       nama_instansi: nama,
       npwp: body.npwp?.trim() || null,
       is_pkp: Boolean(body.is_pkp),
-      ppn_persen: clampPercent(body.ppn_persen),
-      pph23_persen: clampPercent(body.pph23_persen),
+      ppn_persen: clampPercent2(body.ppn_persen),
+      pph23_persen: clampPercent2(body.pph23_persen),
       tempo_hari: Math.max(0, Math.floor(Number(body.tempo_hari ?? 0)) || 0),
-      credit_limit: Math.max(0, round2(Number(body.credit_limit ?? 0))),
+      credit_limit: Math.max(0, round22(Number(body.credit_limit ?? 0))),
       pajak_reklame_expired: body.pajak_reklame_expired || null
     };
     db.instansis.push(instansi);
@@ -3392,13 +4808,13 @@ ${text}`,
     }
     if (body.npwp !== void 0) instansi.npwp = body.npwp?.trim() || null;
     if (body.is_pkp !== void 0) instansi.is_pkp = Boolean(body.is_pkp);
-    if (body.ppn_persen !== void 0) instansi.ppn_persen = clampPercent(body.ppn_persen);
-    if (body.pph23_persen !== void 0) instansi.pph23_persen = clampPercent(body.pph23_persen);
+    if (body.ppn_persen !== void 0) instansi.ppn_persen = clampPercent2(body.ppn_persen);
+    if (body.pph23_persen !== void 0) instansi.pph23_persen = clampPercent2(body.pph23_persen);
     if (body.tempo_hari !== void 0) {
       instansi.tempo_hari = Math.max(0, Math.floor(Number(body.tempo_hari) || 0));
     }
     if (body.credit_limit !== void 0) {
-      instansi.credit_limit = Math.max(0, round2(Number(body.credit_limit) || 0));
+      instansi.credit_limit = Math.max(0, round22(Number(body.credit_limit) || 0));
     }
     if (body.pajak_reklame_expired !== void 0) {
       instansi.pajak_reklame_expired = body.pajak_reklame_expired || null;
@@ -3422,7 +4838,19 @@ ${text}`,
         (o) => o.no_nota.toLowerCase().includes(q) || (o.customer?.instansi ?? "").toLowerCase().includes(q) || (o.customer?.nama_pelanggan ?? "").toLowerCase().includes(q)
       );
     }
-    if (tab === "produksi") {
+    const counts = {
+      semua: hydrated.filter((o) => o.status_nota !== "batal").length,
+      produksi: hydrated.filter(
+        (o) => activeOrderRaw(o) && o.status_nota !== "batal" && !store.isOrderSiapDiambil(o) && !store.isOrderSelesai(o)
+      ).length,
+      siap_diambil: hydrated.filter((o) => o.status_nota !== "batal" && store.isOrderSiapDiambil(o)).length,
+      selesai: hydrated.filter((o) => o.status_nota !== "batal" && store.isOrderSelesai(o)).length,
+      batal: hydrated.filter((o) => o.status_nota === "batal").length,
+      piutang: hydrated.filter((o) => activeOrderRaw(o) && o.status_nota !== "batal" && o.sisa_tagihan > 0).length
+    };
+    if (tab === "semua") {
+      hydrated = hydrated.filter((o) => o.status_nota !== "batal");
+    } else if (tab === "produksi") {
       hydrated = hydrated.filter((o) => activeOrderRaw(o) && !store.isOrderSiapDiambil(o) && !store.isOrderSelesai(o));
     } else if (tab === "siap_diambil") {
       hydrated = hydrated.filter((o) => store.isOrderSiapDiambil(o));
@@ -3433,7 +4861,7 @@ ${text}`,
     } else if (tab === "piutang") {
       hydrated = hydrated.filter((o) => activeOrderRaw(o) && o.sisa_tagihan > 0);
     }
-    res.json({ orders: hydrated });
+    res.json({ orders: hydrated, counts });
   });
   app.get("/api/orders/by-nota/:noNota", requireAuth(), (req, res) => {
     const user = getCurrentUser(req);
@@ -3501,6 +4929,22 @@ ${text}`,
       res.status(422).json({ error: "Minimal harus ada 1 item pada nota." });
       return;
     }
+    const parsedJatuhTempo = parseTanggalInput(payload.jatuh_tempo);
+    if (!parsedJatuhTempo.valid) {
+      res.status(422).json({ error: "Format tanggal jatuh tempo tidak valid. Gunakan format YYYY-MM-DD." });
+      return;
+    }
+    const parsedDeadline = parseTanggalInput(payload.deadline);
+    if (!parsedDeadline.valid) {
+      res.status(422).json({ error: "Format tanggal deadline tidak valid. Gunakan format YYYY-MM-DD." });
+      return;
+    }
+    if (payload.spk_enabled) {
+      if (!payload.spk_jenis_pekerjaan?.trim() || !payload.spk_ukuran_konstruksi?.trim() || !payload.spk_lokasi_pasang?.trim()) {
+        res.status(422).json({ error: "Jenis pekerjaan, ukuran konstruksi, dan lokasi pasang SPK Advertising wajib diisi." });
+        return;
+      }
+    }
     let instansiName = (payload.instansi ?? "").trim() || "Perorangan";
     let instansiObj = payload.instansi_id ? db.instansis.find((i) => i.id === Number(payload.instansi_id)) : db.instansis.find((i) => i.nama_instansi.toLowerCase() === instansiName.toLowerCase());
     if (!instansiObj) {
@@ -3548,22 +4992,22 @@ ${text}`,
       let finishingId = null;
       let hargaSebelumDiskon = 0;
       if (product.kategori_produk === "meteran") {
-        lebar = round2(Number(row.lebar_m));
-        tinggi = round2(Number(row.tinggi_m));
+        lebar = round22(Number(row.lebar_m));
+        tinggi = round22(Number(row.tinggi_m));
         if (!(lebar > 0) || !(tinggi > 0)) {
           res.status(422).json({ error: `Lebar dan tinggi wajib > 0 untuk produk meteran (${product.nama_produk}).` });
           return;
         }
-        luasTagihan = round2(lebar * tinggi * qty);
+        luasTagihan = round22(lebar * tinggi * qty);
         finishingId = row.finishing_id ? Number(row.finishing_id) : null;
-        hargaSebelumDiskon = round2(hargaSatuan * luasTagihan);
+        hargaSebelumDiskon = round22(hargaSatuan * luasTagihan);
       } else {
-        hargaSebelumDiskon = round2(hargaSatuan * qty);
+        hargaSebelumDiskon = round22(hargaSatuan * qty);
       }
-      const itemDiskonPersen = clampPercent(row.diskon_persen);
-      const itemDiskonNominal = round2(hargaSebelumDiskon * itemDiskonPersen / 100);
-      const subtotal = round2(hargaSebelumDiskon - itemDiskonNominal);
-      totalSebelumDiskonNota = round2(totalSebelumDiskonNota + subtotal);
+      const itemDiskonPersen = clampPercent2(row.diskon_persen);
+      const itemDiskonNominal = round22(hargaSebelumDiskon * itemDiskonPersen / 100);
+      const subtotal = round22(hargaSebelumDiskon - itemDiskonNominal);
+      totalSebelumDiskonNota = round22(totalSebelumDiskonNota + subtotal);
       builtItems.push({
         id: 0,
         order_id: 0,
@@ -3596,24 +5040,41 @@ ${text}`,
         file_preview_acc: null,
         file_cetak_tiff: null,
         file_master_arsip: null,
+        preflight_dpi_ok: null,
+        preflight_cmyk_ok: null,
+        preflight_bleed_ok: null,
+        preflight_catatan: null,
         created_at: now,
         updated_at: now
       });
     }
-    const diskonPersen = clampPercent(payload.diskon_persen);
-    const diskonNominal = round2(totalSebelumDiskonNota * diskonPersen / 100);
-    const dpp = round2(totalSebelumDiskonNota - diskonNominal);
-    const defaultPpn = instansiObj.is_pkp ? Number(instansiObj.ppn_persen ?? 11) : Number(instansiObj.ppn_persen ?? 0);
-    const ppnPersen = clampPercent(payload.ppn_persen ?? defaultPpn);
-    const pph23Persen = clampPercent(payload.pph23_persen ?? instansiObj.pph23_persen ?? 0);
-    const ppnNominal = round2(dpp * ppnPersen / 100);
-    const pph23Nominal = round2(dpp * pph23Persen / 100);
-    const totalTagihan = round2(dpp + ppnNominal - pph23Nominal);
+    const biayaDesain = round22(Math.max(0, Number(payload.biaya_desain ?? 0) || 0));
+    totalSebelumDiskonNota = round22(totalSebelumDiskonNota + biayaDesain);
+    const taxSettings = db.tax_settings ?? buildDefaultTaxSettings();
+    const diskonPersen = clampPercent2(payload.diskon_persen);
+    const { ppnPersen, pph23Persen } = computeEffectiveTaxRates({
+      payloadPpn: payload.ppn_persen,
+      payloadPph23: payload.pph23_persen,
+      instansi: instansiObj,
+      taxSettings
+    });
+    const taxCalc = hitungPajakNota({
+      totalSebelumDiskonNota,
+      diskonNotaPersen: diskonPersen,
+      ppnPersen,
+      pph23Persen,
+      modeHarga: taxSettings.mode_harga,
+      ppnTermasukDiskon: taxSettings.ppn_termasuk_diskon
+    });
+    const diskonNominal = taxCalc.diskonNominal;
+    const ppnNominal = taxCalc.ppnNominal;
+    const pph23Nominal = taxCalc.pph23Nominal;
+    const totalTagihan = taxCalc.totalTagihan;
     const tempoHari = Math.max(0, Math.floor(Number(instansiObj.tempo_hari ?? 0)) || 0);
-    const jatuhTempo = payload.jatuh_tempo ? new Date(payload.jatuh_tempo).toISOString() : tempoHari > 0 ? new Date(Date.now() + tempoHari * 864e5).toISOString() : null;
+    const jatuhTempo = parsedJatuhTempo.iso ? parsedJatuhTempo.iso : tempoHari > 0 ? new Date(Date.now() + tempoHari * 864e5).toISOString() : null;
     const creditLimit = Number(instansiObj.credit_limit ?? 0);
     if (creditLimit > 0 && (payload.status_bayar ?? "belum_lunas") !== "lunas") {
-      const piutangAktif = round2(
+      const piutangAktif = round22(
         db.orders.filter((o) => o.customer_id === customer.id && activeOrderRaw(o)).reduce((sum, o) => sum + Math.max(o.total_tagihan - o.jumlah_dp, 0), 0)
       );
       if (piutangAktif + totalTagihan > creditLimit && !payload.override_credit) {
@@ -3625,7 +5086,7 @@ ${text}`,
       }
     }
     let statusBayar = payload.status_bayar ?? "belum_lunas";
-    let jumlahDp = round2(Number(payload.jumlah_dp ?? 0));
+    let jumlahDp = round22(Number(payload.jumlah_dp ?? 0));
     if (statusBayar === "lunas") {
       jumlahDp = totalTagihan;
     } else if (statusBayar === "belum_lunas") {
@@ -3654,6 +5115,7 @@ ${text}`,
       designer_id: null,
       total_tagihan: totalTagihan,
       jumlah_dp: jumlahDp,
+      biaya_desain: biayaDesain,
       status_bayar: statusBayar,
       status_nota: "aktif",
       alasan_batal: null,
@@ -3680,9 +5142,11 @@ ${text}`,
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
-      deadline: payload.deadline ? new Date(payload.deadline).toISOString() : null,
+      deadline: parsedDeadline.iso,
       created_at: now,
       updated_at: now
     };
@@ -3708,10 +5172,6 @@ ${text}`,
       });
     }
     if (payload.spk_enabled) {
-      if (!payload.spk_jenis_pekerjaan?.trim() || !payload.spk_ukuran_konstruksi?.trim() || !payload.spk_lokasi_pasang?.trim()) {
-        res.status(422).json({ error: "Jenis pekerjaan, ukuran konstruksi, dan lokasi pasang SPK Advertising wajib diisi." });
-        return;
-      }
       db.advertising_spks.push({
         id: store.nextId("advertising_spks"),
         order_id: orderId,
@@ -3836,12 +5296,12 @@ ${text}`,
       res.status(422).json({ error: "Nota sudah dibatalkan (void) dan tidak dapat menerima pembayaran." });
       return;
     }
-    const sisa = round2(Math.max(order.total_tagihan - order.jumlah_dp, 0));
+    const sisa = round22(Math.max(order.total_tagihan - order.jumlah_dp, 0));
     if (order.status_bayar === "lunas" || sisa <= 0) {
       res.status(422).json({ error: "Tagihan nota ini sudah berstatus lunas." });
       return;
     }
-    const nominal = round2(Number(req.body.nominal ?? 0));
+    const nominal = round22(Number(req.body.nominal ?? 0));
     const metodeRaw = String(req.body.metode ?? "Tunai");
     const metode = ["Tunai", "Transfer", "QRIS"].includes(metodeRaw) ? metodeRaw : "Tunai";
     const keterangan = String(req.body.keterangan ?? "").trim() || null;
@@ -3869,7 +5329,7 @@ ${text}`,
       shift_id: openShift?.id ?? null,
       created_at: now
     });
-    order.jumlah_dp = round2(Math.min(order.total_tagihan, order.jumlah_dp + actualNominal));
+    order.jumlah_dp = round22(Math.min(order.total_tagihan, order.jumlah_dp + actualNominal));
     order.status_bayar = order.jumlah_dp >= order.total_tagihan ? "lunas" : "dp";
     if (order.status_bayar === "lunas" && buktiPath) {
       order.bukti_pelunasan = buktiPath;
@@ -3910,7 +5370,7 @@ ${text}`,
     const catatan = String(req.body.catatan_pengecualian ?? "").trim();
     const metodeRaw = String(req.body.metode ?? "Tunai");
     const metode = ["Tunai", "Transfer", "QRIS"].includes(metodeRaw) ? metodeRaw : "Tunai";
-    const sisa = round2(Math.max(order.total_tagihan - order.jumlah_dp, 0));
+    const sisa = round22(Math.max(order.total_tagihan - order.jumlah_dp, 0));
     const buktiPath = req.file ? `/uploads/${req.file.filename}` : null;
     const openShift = getOpenShiftFor(admin.id);
     if (sisa > 0) {
@@ -3965,7 +5425,7 @@ ${text}`,
       res.status(422).json({ error: "Alasan pembatalan wajib diisi untuk audit." });
       return;
     }
-    const sudahDibayar = round2(order.jumlah_dp);
+    const sudahDibayar = round22(order.jumlah_dp);
     const now = (/* @__PURE__ */ new Date()).toISOString();
     order.status_nota = "batal";
     order.alasan_batal = alasan;
@@ -3973,9 +5433,12 @@ ${text}`,
     if (sudahDibayar > 0) {
       order.catatan_pengecualian = `VOID/REFUND: ${alasan}. Dana diterima Rp ${sudahDibayar.toLocaleString("id-ID")} wajib direfund.`;
     }
+    let cancelledItems = 0;
     for (const item of db.order_items) {
-      if (item.order_id === order.id && item.status_produksi !== "selesai") {
+      if (item.order_id === order.id && item.status_produksi !== "selesai" && item.status_produksi !== "dibatalkan") {
+        item.status_produksi = "dibatalkan";
         item.updated_at = now;
+        cancelledItems += 1;
       }
     }
     recordAudit(
@@ -3983,7 +5446,7 @@ ${text}`,
       "order_void",
       "order",
       order.id,
-      `Nota ${order.no_nota} dibatalkan. Alasan: ${alasan}. Nilai dibayar Rp ${sudahDibayar.toLocaleString("id-ID")}`,
+      `Nota ${order.no_nota} dibatalkan. Alasan: ${alasan}. Nilai dibayar Rp ${sudahDibayar.toLocaleString("id-ID")}. Item dibatalkan: ${cancelledItems}`,
       clientIp(req)
     );
     store.persist();
@@ -4015,11 +5478,11 @@ ${text}`,
       const product = db.products.find((p) => p.id === old.product_id);
       if (!product) continue;
       const hargaSatuan = priceForCategory(product, sourceCustomer.kategori);
-      const hargaSebelumDiskon = product.kategori_produk === "meteran" ? round2(hargaSatuan * (old.luas_tagihan_m2 ?? 0)) : round2(hargaSatuan * old.qty);
-      const diskonPersen2 = clampPercent(old.diskon_persen);
-      const diskonNominal2 = round2(hargaSebelumDiskon * diskonPersen2 / 100);
-      const subtotal = round2(hargaSebelumDiskon - diskonNominal2);
-      totalSebelumDiskonNota = round2(totalSebelumDiskonNota + subtotal);
+      const hargaSebelumDiskon = product.kategori_produk === "meteran" ? round22(hargaSatuan * (old.luas_tagihan_m2 ?? 0)) : round22(hargaSatuan * old.qty);
+      const diskonPersen2 = clampPercent2(old.diskon_persen);
+      const diskonNominal2 = round22(hargaSebelumDiskon * diskonPersen2 / 100);
+      const subtotal = round22(hargaSebelumDiskon - diskonNominal2);
+      totalSebelumDiskonNota = round22(totalSebelumDiskonNota + subtotal);
       built.push({
         ...old,
         id: 0,
@@ -4035,6 +5498,10 @@ ${text}`,
         file_preview_acc: null,
         file_cetak_tiff: null,
         file_master_arsip: null,
+        preflight_dpi_ok: null,
+        preflight_cmyk_ok: null,
+        preflight_bleed_ok: null,
+        preflight_catatan: null,
         created_at: now,
         updated_at: now
       });
@@ -4043,14 +5510,24 @@ ${text}`,
       res.status(422).json({ error: "Produk pada nota sumber sudah tidak tersedia." });
       return;
     }
-    const diskonPersen = clampPercent(source.diskon_persen);
-    const diskonNominal = round2(totalSebelumDiskonNota * diskonPersen / 100);
-    const dpp = round2(totalSebelumDiskonNota - diskonNominal);
-    const ppnPersen = clampPercent(source.ppn_persen);
-    const pph23Persen = clampPercent(source.pph23_persen);
-    const ppnNominal = round2(dpp * ppnPersen / 100);
-    const pph23Nominal = round2(dpp * pph23Persen / 100);
-    const totalTagihan = round2(dpp + ppnNominal - pph23Nominal);
+    const biayaDesain = round22(Math.max(0, Number(source.biaya_desain ?? 0) || 0));
+    totalSebelumDiskonNota = round22(totalSebelumDiskonNota + biayaDesain);
+    const taxSettings = db.tax_settings ?? buildDefaultTaxSettings();
+    const diskonPersen = clampPercent2(source.diskon_persen);
+    const ppnPersen = clampPercent2(source.ppn_persen);
+    const pph23Persen = clampPercent2(source.pph23_persen);
+    const taxCalc = hitungPajakNota({
+      totalSebelumDiskonNota,
+      diskonNotaPersen: diskonPersen,
+      ppnPersen,
+      pph23Persen,
+      modeHarga: taxSettings.mode_harga,
+      ppnTermasukDiskon: taxSettings.ppn_termasuk_diskon
+    });
+    const diskonNominal = taxCalc.diskonNominal;
+    const ppnNominal = taxCalc.ppnNominal;
+    const pph23Nominal = taxCalc.pph23Nominal;
+    const totalTagihan = taxCalc.totalTagihan;
     const orderId = store.nextId("orders");
     const approvalToken = generateApprovalToken();
     const record = {
@@ -4061,6 +5538,7 @@ ${text}`,
       designer_id: null,
       total_tagihan: totalTagihan,
       jumlah_dp: 0,
+      biaya_desain: biayaDesain,
       status_bayar: "belum_lunas",
       status_nota: "aktif",
       alasan_batal: null,
@@ -4087,6 +5565,8 @@ ${text}`,
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: `Reorder dari ${source.no_nota}`,
       deadline: null,
@@ -4145,7 +5625,7 @@ ${text}`,
       sisa_tagihan: o.sisa_tagihan,
       status_bayar: o.status_bayar
     }));
-    const sisaLain = round2(tagihanLain.reduce((sum, row) => sum + row.sisa_tagihan, 0));
+    const sisaLain = round22(tagihanLain.reduce((sum, row) => sum + row.sisa_tagihan, 0));
     res.json({
       order: {
         no_nota: order.no_nota,
@@ -4156,7 +5636,7 @@ ${text}`,
         approval_note: order.approval_note ?? null,
         approved_by: order.tanda_tangan_admin ?? null,
         catatan_desain: order.catatan_desain ?? null,
-        lampiran_briefing: order.lampiran_briefing ?? null,
+        lampiran_briefing: toPublicPreviewUrl(order.lampiran_briefing, token),
         created_at: order.created_at,
         updated_at: order.updated_at,
         total_tagihan: disetujui ? order.total_tagihan : 0,
@@ -4169,7 +5649,7 @@ ${text}`,
         ppn_nominal: disetujui ? order.ppn_nominal ?? 0 : 0,
         pph23_persen: disetujui ? order.pph23_persen ?? 0 : 0,
         pph23_nominal: disetujui ? order.pph23_nominal ?? 0 : 0,
-        dpp: disetujui ? round2(order.total_tagihan - (order.ppn_nominal ?? 0) + (order.pph23_nominal ?? 0)) : 0,
+        dpp: disetujui ? round22(order.total_tagihan - (order.ppn_nominal ?? 0) + (order.pph23_nominal ?? 0)) : 0,
         jatuh_tempo: order.jatuh_tempo ?? null,
         items: order.items.map((i) => ({
           id: i.id,
@@ -4188,17 +5668,20 @@ ${text}`,
           diskon_persen: disetujui ? i.diskon_persen ?? 0 : 0,
           diskon_nominal: disetujui ? i.diskon_nominal ?? 0 : 0,
           subtotal: disetujui ? i.subtotal : 0,
-          file_preview_acc: i.file_preview_acc,
+          file_preview_acc: toPublicPreviewUrl(i.file_preview_acc, token),
           status_produksi: i.status_produksi
         })),
-        design_revisions: order.design_revisions.slice(0, 5),
+        design_revisions: order.design_revisions.slice(0, 5).map((revision) => ({
+          ...revision,
+          file_preview: toPublicPreviewUrl(revision.file_preview, token)
+        })),
         payments: disetujui ? order.payments.map((p) => ({
           id: p.id,
           tanggal: p.tanggal,
           nominal: p.nominal,
           metode: p.metode,
           keterangan: p.keterangan ?? null,
-          bukti_bayar: p.bukti_bayar ?? null,
+          bukti_bayar: toPublicPreviewUrl(p.bukti_bayar, token),
           admin_name: p.admin_name ?? null
         })) : [],
         tagihan_lain: disetujui ? tagihanLain : [],
@@ -4207,7 +5690,7 @@ ${text}`,
           sudah_dibayar: disetujui ? order.jumlah_dp : 0,
           sisa_tagihan: disetujui ? order.sisa_tagihan : 0,
           sisa_tagihan_lain: disetujui ? sisaLain : 0,
-          total_harus_dibayar: disetujui ? round2(order.sisa_tagihan + sisaLain) : 0
+          total_harus_dibayar: disetujui ? round22(order.sisa_tagihan + sisaLain) : 0
         }
       }
     });
@@ -4245,7 +5728,14 @@ ${text}`,
     order.updated_at = now;
     const items = db.order_items.filter((i) => i.order_id === order.id);
     if (decision === "disetujui") {
+      const namaPic = body.nama?.trim() || "Pelanggan";
       order.tanda_tangan_admin = body.nama?.trim() || order.tanda_tangan_admin;
+      for (const item of items) {
+        item.acc_pelanggan_at = now;
+        item.acc_pelanggan_nama = namaPic;
+        item.acc_pelanggan_id = order.customer_id ?? null;
+        item.updated_at = now;
+      }
     } else {
       for (const item of items) {
         if (item.status_produksi === "menunggu_acc" || item.status_produksi === "proses_desain") {
@@ -4314,7 +5804,7 @@ ${text}`,
   });
   app.post("/api/shifts/open", requireAuth(["admin"]), (req, res) => {
     const user = getCurrentUser(req);
-    const openingCash = round2(Number(req.body.opening_cash ?? 0));
+    const openingCash = round22(Number(req.body.opening_cash ?? 0));
     if (openingCash < 0) {
       res.status(422).json({ error: "Saldo awal kas tidak boleh negatif." });
       return;
@@ -4364,9 +5854,9 @@ ${text}`,
     }
     const body = req.body;
     const expected = computeShiftExpectation(shift);
-    const actualTunai = round2(Number(body.actual_tunai ?? expected.tunai));
-    const actualTransfer = round2(Number(body.actual_transfer ?? expected.transfer));
-    const actualQris = round2(Number(body.actual_qris ?? expected.qris));
+    const actualTunai = round22(Number(body.actual_tunai ?? expected.tunai));
+    const actualTransfer = round22(Number(body.actual_transfer ?? expected.transfer));
+    const actualQris = round22(Number(body.actual_qris ?? expected.qris));
     if ([actualTunai, actualTransfer, actualQris].some((n) => !Number.isFinite(n) || n < 0)) {
       res.status(422).json({ error: "Nominal hitung fisik kas tidak boleh negatif." });
       return;
@@ -4379,7 +5869,7 @@ ${text}`,
     shift.actual_tunai = actualTunai;
     shift.actual_transfer = actualTransfer;
     shift.actual_qris = actualQris;
-    shift.selisih = round2(
+    shift.selisih = round22(
       actualTunai + actualTransfer + actualQris - (expected.tunai + expected.transfer + expected.qris)
     );
     shift.catatan = String(body.catatan ?? "").trim() || null;
@@ -4435,11 +5925,11 @@ ${text}`,
       res.status(403).json({ error: "Terima job terlebih dahulu sebelum mengunggah preview." });
       return;
     }
-    const previewUrl = req.file ? `/uploads/${req.file.filename}` : String(req.body.preset_url ?? "").trim();
-    if (!previewUrl) {
-      res.status(422).json({ error: "File gambar preview (JPG/PNG) wajib diunggah." });
+    if (!req.file) {
+      res.status(422).json({ error: "File gambar preview (JPG/PNG/WEBP) wajib diunggah." });
       return;
     }
+    const previewUrl = `/uploads/${req.file.filename}`;
     const now = (/* @__PURE__ */ new Date()).toISOString();
     for (const rev of db.design_revisions) {
       if (rev.order_id === order.id && rev.status_revisi === "menunggu") {
@@ -4481,9 +5971,10 @@ ${text}`,
       "preview_siap_acc",
       `preview_siap_acc:${order.id}:${previewUrl}`,
       previewOrder.customer?.no_wa ?? "",
-      `Preview desain Nota ${order.no_nota} siap di-ACC. Silakan cek tautan berikut.`,
+      `Preview desain Nota ${order.no_nota} siap di-ACC. Silakan cek & koreksi melalui tautan Self-ACC berikut.`,
       order.id,
-      order.approval_token ? `${appBaseUrl()}/acc/${order.approval_token}` : `${appBaseUrl()}/?nota=${order.no_nota}`
+      order.approval_token ? `${appBaseUrl()}/acc/${order.approval_token}` : `${appBaseUrl()}/?nota=${order.no_nota}`,
+      previewUrl
     );
     res.json({ order: previewOrder });
   });
@@ -4491,14 +5982,34 @@ ${text}`,
     const db = store.getState();
     const item = db.order_items.find((i) => i.id === Number(req.params.itemId));
     if (!item) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(404).json({ error: "Item tidak ditemukan." });
       return;
     }
     if (!item.acc_admin_id) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(422).json({ error: "Item wajib disetujui (ACC) Admin terlebih dahulu sebelum unggah TIFF." });
       return;
     }
+    if (req.file && !isTiffFilename(req.file.originalname)) {
+      cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: "File cetak item wajib berformat .tif atau .tiff." });
+      return;
+    }
     const tiffName = req.file ? `/uploads/${req.file.filename}` : String(req.body.filename ?? "").trim() || `cetak-item-${item.id}.tif`;
+    const body = req.body ?? {};
+    const parseBool = (v) => {
+      if (v === void 0 || v === null || v === "") return null;
+      if (typeof v === "boolean") return v;
+      const s = String(v).trim().toLowerCase();
+      if (["true", "1", "ya", "yes", "ok"].includes(s)) return true;
+      if (["false", "0", "tidak", "no"].includes(s)) return false;
+      return null;
+    };
+    if (body.preflight_dpi_ok !== void 0) item.preflight_dpi_ok = parseBool(body.preflight_dpi_ok);
+    if (body.preflight_cmyk_ok !== void 0) item.preflight_cmyk_ok = parseBool(body.preflight_cmyk_ok);
+    if (body.preflight_bleed_ok !== void 0) item.preflight_bleed_ok = parseBool(body.preflight_bleed_ok);
+    if (body.preflight_catatan !== void 0) item.preflight_catatan = String(body.preflight_catatan ?? "").trim() || null;
     item.file_cetak_tiff = tiffName;
     item.updated_at = (/* @__PURE__ */ new Date()).toISOString();
     store.persist();
@@ -4506,20 +6017,116 @@ ${text}`,
     const order = db.orders.find((o) => o.id === item.order_id);
     res.json({ order: store.hydrateOrder(order) });
   });
+  app.post(
+    "/api/desainer/orders/:id/tiff-massal",
+    requireAuth(["desainer"]),
+    uploadBulkTiff.array("files", 30),
+    (req, res) => {
+      const files = req.files ?? [];
+      const db = store.getState();
+      const order = db.orders.find((o) => o.id === Number(req.params.id));
+      if (!order) {
+        cleanupUploadedFiles(files);
+        res.status(404).json({ error: "Nota tidak ditemukan." });
+        return;
+      }
+      if (files.length === 0) {
+        res.status(422).json({ error: "Pilih minimal 1 file .TIFF untuk diunggah." });
+        return;
+      }
+      let explicitMap;
+      const rawMap = req.body.peta;
+      if (typeof rawMap === "string" && rawMap.trim()) {
+        try {
+          const parsed = JSON.parse(rawMap);
+          if (Array.isArray(parsed)) explicitMap = parsed;
+        } catch {
+          cleanupUploadedFiles(files);
+          res.status(422).json({ error: "Format peta pemetaan file TIFF tidak valid." });
+          return;
+        }
+      }
+      const orderItems = db.order_items.filter((i) => i.order_id === order.id);
+      const hydratedItems = orderItems.map((i) => store.hydrateItem(i));
+      const resolution = resolveBulkTiffMapping({
+        filenames: files.map((f) => f.originalname),
+        items: hydratedItems,
+        explicitMap
+      });
+      if (!resolution.ok) {
+        cleanupUploadedFiles(files);
+        res.status(422).json({
+          error: resolution.errors[0] || `File berikut belum memiliki pasangan item yang valid: ${resolution.unmapped.join(", ")}`,
+          unmapped: resolution.unmapped,
+          errors: resolution.errors
+        });
+        return;
+      }
+      const fileByOriginal = new Map(files.map((f) => [f.originalname, f]));
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const body = req.body ?? {};
+      const parseBool = (v) => {
+        if (v === void 0 || v === null || v === "") return null;
+        if (typeof v === "boolean") return v;
+        const s = String(v).trim().toLowerCase();
+        if (["true", "1", "ya", "yes", "ok"].includes(s)) return true;
+        if (["false", "0", "tidak", "no"].includes(s)) return false;
+        return null;
+      };
+      const preflight = {
+        dpi: body.preflight_dpi_ok !== void 0 ? parseBool(body.preflight_dpi_ok) : void 0,
+        cmyk: body.preflight_cmyk_ok !== void 0 ? parseBool(body.preflight_cmyk_ok) : void 0,
+        bleed: body.preflight_bleed_ok !== void 0 ? parseBool(body.preflight_bleed_ok) : void 0,
+        catatan: body.preflight_catatan !== void 0 ? String(body.preflight_catatan ?? "").trim() || null : void 0
+      };
+      for (const pair of resolution.mappings) {
+        const file = fileByOriginal.get(pair.filename);
+        const target = orderItems.find((i) => i.id === pair.itemId);
+        target.file_cetak_tiff = `/uploads/${file.filename}`;
+        if (preflight.dpi !== void 0) target.preflight_dpi_ok = preflight.dpi;
+        if (preflight.cmyk !== void 0) target.preflight_cmyk_ok = preflight.cmyk;
+        if (preflight.bleed !== void 0) target.preflight_bleed_ok = preflight.bleed;
+        if (preflight.catatan !== void 0) target.preflight_catatan = preflight.catatan;
+        target.updated_at = now;
+      }
+      order.updated_at = now;
+      auditRequest(
+        req,
+        "tiff_massal_upload",
+        "order",
+        order.id,
+        `${resolution.mappings.length} file TIFF diunggah massal untuk Nota ${order.no_nota}.`
+      );
+      store.persist();
+      broadcastEvent("design_updated", { orderId: order.id });
+      res.json({ order: store.hydrateOrder(order), uploaded: resolution.mappings.length });
+    }
+  );
   app.post("/api/desainer/orders/:id/master", requireAuth(["desainer"]), upload.single("file_master_arsip"), (req, res) => {
     const desainer = getCurrentUser(req);
     const db = store.getState();
     const order = db.orders.find((o) => o.id === Number(req.params.id));
     if (!order) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(404).json({ error: "Nota tidak ditemukan." });
       return;
     }
     const items = db.order_items.filter((i) => i.order_id === order.id);
     if (items.length === 0 || !items.every((i) => Boolean(i.file_cetak_tiff))) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(422).json({ error: "Seluruh item dalam nota wajib memiliki file cetak .TIFF sebelum finalisasi master." });
       return;
     }
-    const masterFile = req.file ? `/uploads/${req.file.filename}` : String(req.body.filename ?? "").trim() || `MASTER-${order.no_nota}.cdr`;
+    if (!req.file) {
+      res.status(422).json({ error: "Wajib mengunggah file master editable (.AI / .PSD / .CDR) saat finalisasi master." });
+      return;
+    }
+    if (!isEditableMasterFilename(req.file.originalname)) {
+      cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: "Format master wajib editable (.ai, .psd, atau .cdr). Format lain ditolak." });
+      return;
+    }
+    const masterFile = `/uploads/${req.file.filename}`;
     const ttd = String(req.body.tanda_tangan ?? "").trim() || desainer.name;
     const now = (/* @__PURE__ */ new Date()).toISOString();
     order.file_master_arsip = masterFile;
@@ -4536,9 +6143,56 @@ ${text}`,
     broadcastEvent("production_updated", { orderId: order.id });
     res.json({ order: store.hydrateOrder(order) });
   });
+  const mesinUtamaCetak = (db, product) => {
+    const aktif = db.machines.find((m) => m.aktif);
+    if (aktif) return aktif;
+    if (product?.mesin_default_id) {
+      return db.machines.find((m) => m.id === product.mesin_default_id) ?? null;
+    }
+    return null;
+  };
+  const catatTintaPerWarna = (db, params) => {
+    const ids = [...new Set(params.warnaIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+    if (ids.length === 0) {
+      return { totalMl: 0, rincian: [], peringatan: null };
+    }
+    const warnaList = ids.map((id) => db.tinta_warna.find((w) => w.id === id && w.aktif)).filter((w) => Boolean(w)).map((w) => ({
+      id: w.id,
+      warna: w.warna,
+      konsumsi_ml_per_m2: Number(w.konsumsi_ml_per_m2 ?? 0) || hitungTintaMlPerM2()
+    }));
+    const hitung = hitungPemakaianTintaPerWarna(params.luasCetakM2, warnaList);
+    let peringatan = null;
+    const rincian = [];
+    for (const row of hitung.rincian) {
+      const tinta = db.tinta_warna.find((w) => w.id === row.tinta_warna_id);
+      if (!tinta) continue;
+      const pakai = Math.min(Number(tinta.stok_ml ?? 0), row.jumlah_ml);
+      tinta.stok_ml = round22(Number(tinta.stok_ml ?? 0) - pakai);
+      tinta.updated_at = params.now;
+      if (pakai + 1e-3 < row.jumlah_ml) {
+        peringatan = `Stok tinta ${tinta.warna} tidak mencukupi; pemakaian dibatasi.`;
+      }
+      db.pemakaian_tinta.push({
+        id: store.nextId("pemakaian_tinta"),
+        order_item_id: params.orderItemId,
+        grup_id: params.grupId,
+        tinta_warna_id: tinta.id,
+        warna: tinta.warna,
+        jumlah_ml: round22(pakai),
+        luas_cetak_m2: round22(params.luasCetakM2),
+        created_at: params.now
+      });
+      rincian.push({ warna: tinta.warna, jumlah_ml: round22(pakai) });
+    }
+    if (warnaList.length < ids.length) {
+      peringatan = peringatan ?? "Sebagian warna tinta tidak aktif atau tidak ditemukan.";
+    }
+    return { totalMl: round22(rincian.reduce((sum, r) => sum + r.jumlah_ml, 0)), rincian, peringatan };
+  };
   app.get("/api/operator/queue", requireAuth(["operator_cetak"]), (_req, res) => {
     const db = store.getState();
-    const items = db.order_items.filter((i) => i.status_produksi === "antrean_cetak" || i.status_produksi === "proses_cetak").filter((i) => {
+    const items = db.order_items.filter((i) => ["antrean_cetak", "siap_tata", "proses_cetak", "gagal_cetak", "cetak_ulang"].includes(i.status_produksi)).filter((i) => {
       const order = db.orders.find((o) => o.id === i.order_id);
       return order ? activeOrderRaw(order) : false;
     }).map((i) => {
@@ -4558,22 +6212,34 @@ ${text}`,
       offcuts: db.material_offcuts.filter((o) => o.status === "tersedia"),
       machines: db.machines.filter((m) => m.aktif),
       supplies: db.supplies.filter((s) => s.aktif),
-      batches: db.print_batches.slice(-20).reverse()
+      batches: db.print_batches.slice(-20).reverse(),
+      cattoffs: db.stok_cattoff.filter((c) => c.status === "aktif"),
+      tinta_warna: db.tinta_warna.filter((w) => w.aktif),
+      grup: db.cetak_grup.slice(-20).reverse().map((g) => ({
+        ...g,
+        operator_name: db.users.find((u) => u.id === g.operator_id)?.name ?? null,
+        machine_name: db.machines.find((m) => m.id === g.machine_id)?.nama_mesin ?? null,
+        items: db.cetak_grup_item.filter((gi) => gi.grup_id === g.id).map((gi) => ({
+          ...gi,
+          no_nota: db.orders.find((o) => o.id === db.order_items.find((it) => it.id === gi.order_item_id)?.order_id)?.no_nota ?? "-",
+          nama_item: db.order_items.find((it) => it.id === gi.order_item_id)?.nama_item ?? null,
+          qty_order: db.order_items.find((it) => it.id === gi.order_item_id)?.qty ?? 0
+        }))
+      }))
     });
   });
   app.post("/api/operator/items/:id/mulai", requireAuth(["operator_cetak"]), (req, res) => {
     const operator = getCurrentUser(req);
     const db = store.getState();
     const item = db.order_items.find((i) => i.id === Number(req.params.id));
-    if (!item || item.status_produksi !== "antrean_cetak") {
-      res.status(403).json({ error: "Item tidak berada pada status Antrean Cetak." });
+    if (!item || !["antrean_cetak", "siap_tata", "gagal_cetak", "cetak_ulang"].includes(item.status_produksi)) {
+      res.status(403).json({ error: "Item tidak berada pada status siap cetak." });
       return;
     }
     const product = db.products.find((p) => p.id === item.product_id);
-    const machineId = Number(req.body.machine_id ?? item.machine_id ?? product?.mesin_default_id ?? 0);
-    const machine = db.machines.find((m) => m.id === machineId && m.aktif);
+    const machine = mesinUtamaCetak(db, product);
     if (!machine) {
-      res.status(422).json({ error: "Pilih mesin cetak aktif yang akan dipakai." });
+      res.status(422).json({ error: "Mesin cetak aktif belum tersedia." });
       return;
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -4586,205 +6252,709 @@ ${text}`,
     broadcastEvent("production_updated", { orderId: item.order_id });
     res.json({ item: store.hydrateItem(item) });
   });
-  app.post("/api/operator/items/:id/selesai", requireAuth(["operator_cetak"]), (req, res) => {
+  app.post("/api/operator/items/:id/siap-tata", requireAuth(["operator_cetak"]), (req, res) => {
+    const operator = getCurrentUser(req);
     const db = store.getState();
-    const item = db.order_items.find((i) => i.id === Number(req.params.id));
-    if (!item || !["antrean_cetak", "proses_cetak"].includes(item.status_produksi)) {
-      res.status(403).json({ error: "Item tidak berada di antrean cetak." });
-      return;
-    }
-    const parentOrder = db.orders.find((o) => o.id === item.order_id);
-    if (!parentOrder || !activeOrderRaw(parentOrder)) {
-      res.status(422).json({ error: "Nota sudah dibatalkan (void). Produksi tidak dapat dilanjutkan." });
-      return;
-    }
-    const product = db.products.find((p) => p.id === item.product_id);
-    if (!product) {
-      res.status(404).json({ error: "Produk tidak ditemukan." });
-      return;
-    }
-    const {
-      sumber_bahan,
-      material_roll_id,
-      material_offcut_id,
-      orientasi_potong,
-      machine_id
-    } = req.body;
-    const machineId = Number(machine_id ?? item.machine_id ?? product.mesin_default_id ?? 0);
-    const machine = db.machines.find((m) => m.id === machineId && m.aktif) ?? null;
-    if (!machine) {
-      res.status(422).json({ error: "Mesin cetak aktif belum ditentukan untuk item ini." });
+    const item = db.order_items.find((i) => i.id === parsePositiveId(req.params.id));
+    if (!item || !["antrean_cetak", "cetak_ulang"].includes(item.status_produksi)) {
+      res.status(422).json({ error: "Item tidak berada di antrean penataan." });
       return;
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    let luasCetakM2 = 0;
-    if (product.kategori_produk === "meteran") {
-      const finishing = item.finishing_id ? db.finishings.find((f) => f.id === item.finishing_id) ?? null : null;
-      const ukuranKotor = computeUkuranKotor(item.lebar_m ?? 0, item.tinggi_m ?? 0, item.qty, finishing);
-      const orientasi = orientasi_potong === "lebar" ? "lebar" : "panjang";
-      const panjangPakai = round2(orientasi === "lebar" ? ukuranKotor.lebar * item.qty : ukuranKotor.tinggi * item.qty);
-      const lebarPakai = round2(orientasi === "lebar" ? ukuranKotor.tinggi : ukuranKotor.lebar);
-      const luasNetto = round2((item.lebar_m ?? 0) * (item.tinggi_m ?? 0) * item.qty);
-      luasCetakM2 = luasNetto;
-      const wosFinishing = round2(Math.max(ukuranKotor.luas - luasNetto, 0));
-      let wosPotong = 0;
-      let rollId = null;
-      let offcutId = null;
-      if (sumber_bahan === "offcut") {
-        const offcut = db.material_offcuts.find((o) => o.id === Number(material_offcut_id));
-        if (!offcut || offcut.status !== "tersedia") {
-          res.status(422).json({ error: "Stok potongan (offcut) tidak tersedia." });
-          return;
-        }
-        if (offcut.lebar_m + 1e-3 < lebarPakai) {
-          res.status(422).json({ error: `Lebar potongan (${offcut.lebar_m} m) kurang dari kebutuhan (${lebarPakai} m).` });
-          return;
-        }
-        if (offcut.panjang_m + 1e-3 < panjangPakai) {
-          res.status(422).json({ error: `Panjang potongan (${offcut.panjang_m} m) kurang dari kebutuhan (${panjangPakai} m).` });
-          return;
-        }
-        offcut.status = "terpakai";
-        offcutId = offcut.id;
-      } else {
-        const roll = db.material_rolls.find((r) => r.id === Number(material_roll_id));
-        if (!roll || roll.status !== "aktif") {
-          res.status(422).json({ error: "Roll bahan aktif wajib dipilih." });
-          return;
-        }
-        if (roll.lebar_m + 1e-3 < lebarPakai) {
-          res.status(422).json({ error: `Lebar roll (${roll.lebar_m} m) kurang dari lebar kotor (${lebarPakai} m).` });
-          return;
-        }
-        if (roll.panjang_sisa_m + 1e-3 < panjangPakai) {
-          res.status(422).json({ error: `Sisa panjang roll (${roll.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).` });
-          return;
-        }
-        const sisaRoll = round2(roll.panjang_sisa_m - panjangPakai);
-        roll.panjang_sisa_m = sisaRoll;
-        roll.status = sisaRoll <= 0 ? "habis" : "aktif";
-        rollId = roll.id;
-        const sisaLebar = round2(roll.lebar_m - lebarPakai);
-        if (sisaLebar >= 0.5) {
-          db.material_offcuts.push({
-            id: store.nextId("material_offcuts"),
-            material_roll_id: roll.id,
-            kode_roll: roll.kode_roll,
-            jenis_bahan: roll.jenis_bahan,
-            lebar_m: sisaLebar,
-            panjang_m: panjangPakai,
-            luas_m2: round2(sisaLebar * panjangPakai),
-            status: "tersedia",
-            created_at: now
-          });
-        } else {
-          wosPotong = round2(Math.max(sisaLebar, 0) * panjangPakai);
-        }
-      }
-      db.material_logs.push({
-        id: store.nextId("material_logs"),
-        order_item_id: item.id,
-        material_roll_id: rollId,
-        material_offcut_id: offcutId,
-        luas_netto_m2: luasNetto,
-        wos_finishing_m2: wosFinishing,
-        wos_potong_m2: wosPotong,
-        gagal_cetak_m2: 0,
-        keterangan: `Selesai cetak | ${product.nama_produk} | ${panjangPakai} m`,
-        created_at: now
-      });
-    } else {
-      if (product.stok_pcs !== null) {
-        if (product.stok_pcs < item.qty) {
-          res.status(422).json({ error: `Stok produk satuan ${product.nama_produk} tidak mencukupi.` });
-          return;
-        }
-        product.stok_pcs -= item.qty;
-      }
-      if ((product.satuan_hitung ?? "pcs") === "klik") {
-        luasCetakM2 = round2(item.qty * A3_PLUS_AREA_M2);
-      }
-    }
-    const klikTotal = (product.satuan_hitung ?? "pcs") === "klik" ? item.qty * (product.klik_per_lembar ?? 1) : null;
-    const estimasiTinta = round2(luasCetakM2 * (machine.konsumsi_tinta_ml_per_m2 ?? 0));
-    let peringatanStok = null;
-    if (estimasiTinta > 0) {
-      const ink = selectInkSupply(db, machine);
-      if (!ink) {
-        peringatanStok = "Stok tinta tidak tersedia; estimasi tetap dicatat.";
-      } else {
-        const pakai = round2(Math.min(ink.stok, estimasiTinta));
-        ink.stok = round2(ink.stok - pakai);
-        ink.updated_at = now;
-        db.supply_usages.push({
-          id: store.nextId("supply_usages"),
-          supply_id: ink.id,
-          order_item_id: item.id,
-          jumlah: pakai,
-          satuan: ink.satuan,
-          keterangan: `Estimasi tinta cetak | ${product.nama_produk} | ${machine.nama_mesin}`,
-          user_id: getCurrentUser(req).id,
-          created_at: now
-        });
-        if (pakai + 1e-3 < estimasiTinta) {
-          peringatanStok = `Stok ${ink.nama} hanya ${ink.stok.toLocaleString("id-ID")} ${ink.satuan}; pemakaian dibatasi.`;
-        }
-      }
-    }
-    item.machine_id = machine.id;
-    item.operator_id = getCurrentUser(req).id;
-    item.klik_total = klikTotal;
-    item.estimasi_tinta_ml = estimasiTinta;
-    item.waktu_mulai_cetak = item.waktu_mulai_cetak ?? now;
-    item.waktu_selesai_cetak = now;
-    item.status_produksi = item.finishing_id ? "antrean_finishing" : "siap_diambil";
+    item.status_produksi = "siap_tata";
+    item.ditata_at = now;
+    item.operator_id = operator.id;
     item.updated_at = now;
     store.persist();
+    auditRequest(req, "operator_siap_tata", "order_item", item.id, `${operator.name} menandai ${item.nama_item ?? "item"} siap ditata.`);
     broadcastEvent("production_updated", { orderId: item.order_id });
-    enqueueSiapDiambil(item.order_id);
-    res.json({ item: store.hydrateItem(item), estimasi_tinta_ml: estimasiTinta, klik_total: klikTotal, peringatan_stok: peringatanStok });
+    res.json({ item: store.hydrateItem(item) });
   });
-  app.post("/api/operator/items/:id/gagal-cetak", requireAuth(["operator_cetak"]), (req, res) => {
-    const db = store.getState();
-    const item = db.order_items.find((i) => i.id === Number(req.params.id));
-    if (!item || !["antrean_cetak", "proses_cetak"].includes(item.status_produksi)) {
-      res.status(403).json({ error: "Item tidak berada di antrean cetak." });
-      return;
+  app.post("/api/operator/items/:id/selesai", requireAuth(["operator_cetak"]), async (req, res) => {
+    await runTransactional(
+      res,
+      () => store.critical(
+        [
+          "order_items",
+          "material_rolls",
+          "material_offcuts",
+          "stok_cattoff",
+          "products",
+          "supplies",
+          "tinta_warna",
+          "pemakaian_tinta",
+          "audit_logs"
+        ],
+        () => {
+          const db = store.getState();
+          const item = db.order_items.find((i) => i.id === Number(req.params.id));
+          if (!item) {
+            res.status(404).json({ error: "Item tidak ditemukan." });
+            return;
+          }
+          if (item.status_produksi === "gagal_cetak") {
+            res.status(422).json({ error: "Item berstatus Gagal Cetak wajib dimulai cetak ulang sebelum diselesaikan." });
+            return;
+          }
+          if (!["antrean_cetak", "siap_tata", "proses_cetak", "cetak_ulang"].includes(item.status_produksi)) {
+            res.status(403).json({ error: "Item tidak berada di antrean cetak." });
+            return;
+          }
+          const parentOrder = db.orders.find((o) => o.id === item.order_id);
+          if (!parentOrder || !activeOrderRaw(parentOrder)) {
+            res.status(422).json({ error: "Nota sudah dibatalkan (void). Produksi tidak dapat dilanjutkan." });
+            return;
+          }
+          const product = db.products.find((p) => p.id === item.product_id);
+          if (!product) {
+            res.status(404).json({ error: "Produk tidak ditemukan." });
+            return;
+          }
+          const {
+            sumber_bahan,
+            material_roll_id,
+            cattoff_id,
+            material_offcut_id,
+            orientasi_potong,
+            panjang_file_m,
+            lebar_file_m,
+            offcut_lebar_m,
+            offcut_panjang_m,
+            warna_tinta_ids
+          } = req.body;
+          const machine = mesinUtamaCetak(db, product);
+          if (!machine) {
+            res.status(422).json({ error: "Mesin cetak aktif belum ditentukan untuk item ini." });
+            return;
+          }
+          const now = (/* @__PURE__ */ new Date()).toISOString();
+          const qtySisa = Math.max(1, Math.floor(Number(item.qty) || 1) - (Number(item.qty_tercetak) || 0));
+          let luasCetakM2 = 0;
+          let catatanBahan = "";
+          if (product.kategori_produk === "meteran") {
+            const finishing = item.finishing_id ? db.finishings.find((f) => f.id === item.finishing_id) ?? null : null;
+            const ukuranKotor = computeUkuranKotor(item.lebar_m ?? 0, item.tinggi_m ?? 0, qtySisa, finishing);
+            const panjangFile = Math.max(0, round22(Number(panjang_file_m ?? 0)));
+            const lebarFile = Math.max(0, round22(Number(lebar_file_m ?? 0)));
+            const pakaiFile = panjangFile > 0 && lebarFile > 0;
+            const orientasi = orientasi_potong === "lebar" ? "lebar" : "panjang";
+            const panjangPakai = pakaiFile ? round22(panjangFile * qtySisa) : round22(orientasi === "lebar" ? ukuranKotor.lebar * qtySisa : ukuranKotor.tinggi * qtySisa);
+            const lebarPakai = pakaiFile ? lebarFile : round22(orientasi === "lebar" ? ukuranKotor.tinggi : ukuranKotor.lebar);
+            const luasNetto = pakaiFile ? round22(panjangFile * lebarFile * qtySisa) : round22((item.lebar_m ?? 0) * (item.tinggi_m ?? 0) * qtySisa);
+            if (!(panjangPakai > 0) || !(lebarPakai > 0)) {
+              res.status(422).json({ error: "Dimensi file .prn tidak valid." });
+              return;
+            }
+            luasCetakM2 = luasNetto;
+            const wosFinishing = round22(Math.max(ukuranKotor.luas - luasNetto, 0));
+            const offLebar = Math.max(0, round22(Number(offcut_lebar_m ?? 0)));
+            const offPanjangInput = Math.max(0, round22(Number(offcut_panjang_m ?? 0)));
+            let containerWidthM = 0;
+            let rollId = null;
+            let offcutId = null;
+            let cattoffId = null;
+            if (sumber_bahan === "offcut") {
+              const offcut = db.material_offcuts.find((o) => o.id === Number(material_offcut_id));
+              if (!offcut || offcut.status !== "tersedia") {
+                res.status(422).json({ error: "Stok potongan (offcut) tidak tersedia." });
+                return;
+              }
+              if (offcut.lebar_m + 1e-3 < lebarPakai) {
+                res.status(422).json({ error: `Lebar potongan (${offcut.lebar_m} m) kurang dari kebutuhan (${lebarPakai} m).` });
+                return;
+              }
+              if (offcut.panjang_m + 1e-3 < panjangPakai) {
+                res.status(422).json({ error: `Panjang potongan (${offcut.panjang_m} m) kurang dari kebutuhan (${panjangPakai} m).` });
+                return;
+              }
+              offcut.status = "terpakai";
+              offcutId = offcut.id;
+              containerWidthM = offcut.lebar_m;
+              catatanBahan = `offcut ${offcut.kode_roll ?? offcut.id}`;
+            } else if (sumber_bahan === "cattoff") {
+              const cattoff = db.stok_cattoff.find((c) => c.id === Number(cattoff_id));
+              if (!cattoff || cattoff.status !== "aktif") {
+                res.status(422).json({ error: "Stok cattoff aktif wajib dipilih." });
+                return;
+              }
+              if (cattoff.lebar_m + 1e-3 < lebarPakai) {
+                res.status(422).json({ error: `Lebar cattoff (${cattoff.lebar_m} m) kurang dari kebutuhan (${lebarPakai} m).` });
+                return;
+              }
+              if (cattoff.panjang_sisa_m + 1e-3 < panjangPakai) {
+                res.status(422).json({ error: `Sisa panjang cattoff (${cattoff.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).` });
+                return;
+              }
+              const sisa = round22(cattoff.panjang_sisa_m - panjangPakai);
+              cattoff.panjang_sisa_m = sisa;
+              cattoff.status = sisa <= 0 ? "habis" : "aktif";
+              cattoff.updated_at = now;
+              cattoffId = cattoff.id;
+              containerWidthM = cattoff.lebar_m;
+              catatanBahan = `cattoff ${cattoff.kode}`;
+            } else {
+              const roll = db.material_rolls.find((r) => r.id === Number(material_roll_id));
+              if (!roll || roll.status !== "aktif") {
+                res.status(422).json({ error: "Roll bahan aktif wajib dipilih." });
+                return;
+              }
+              if (roll.lebar_m + 1e-3 < lebarPakai) {
+                res.status(422).json({ error: `Lebar roll (${roll.lebar_m} m) kurang dari lebar kotor (${lebarPakai} m).` });
+                return;
+              }
+              if (roll.panjang_sisa_m + 1e-3 < panjangPakai) {
+                res.status(422).json({ error: `Sisa panjang roll (${roll.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).` });
+                return;
+              }
+              const sisaRoll = round22(roll.panjang_sisa_m - panjangPakai);
+              roll.panjang_sisa_m = sisaRoll;
+              roll.status = sisaRoll <= 0 ? "habis" : "aktif";
+              rollId = roll.id;
+              containerWidthM = roll.lebar_m;
+              catatanBahan = `roll ${roll.kode_roll}`;
+            }
+            const offPanjang = offPanjangInput > 0 ? offPanjangInput : offLebar > 0 ? panjangPakai : 0;
+            const hitungBahan = hitungPemakaianBahanPrn({
+              panjangFileM: panjangPakai,
+              lebarFileM: lebarPakai,
+              containerWidthM,
+              manualOffcutLebarM: offLebar,
+              manualOffcutPanjangM: offPanjang
+            });
+            if (hitungBahan.createsManualOffcut) {
+              const sourceRoll = rollId ? db.material_rolls.find((r) => r.id === rollId) : null;
+              const sourceCattoff = cattoffId ? db.stok_cattoff.find((c) => c.id === cattoffId) : null;
+              db.material_offcuts.push({
+                id: store.nextId("material_offcuts"),
+                material_roll_id: rollId,
+                kode_roll: sourceRoll?.kode_roll ?? sourceCattoff?.kode ?? null,
+                jenis_bahan: sourceRoll?.jenis_bahan ?? sourceCattoff?.jenis_bahan ?? product.nama_produk,
+                lebar_m: offLebar,
+                panjang_m: offPanjang,
+                luas_m2: round22(offLebar * offPanjang),
+                status: "tersedia",
+                created_at: now
+              });
+              offcutId = db.material_offcuts[db.material_offcuts.length - 1].id;
+            }
+            db.material_logs.push({
+              id: store.nextId("material_logs"),
+              order_item_id: item.id,
+              material_roll_id: rollId,
+              material_offcut_id: offcutId,
+              luas_netto_m2: luasNetto,
+              wos_finishing_m2: wosFinishing,
+              wos_potong_m2: hitungBahan.wosPotongM2,
+              gagal_cetak_m2: 0,
+              keterangan: `Selesai cetak | ${product.nama_produk} | ${panjangPakai} m | ${catatanBahan}`,
+              created_at: now
+            });
+          } else {
+            if (product.stok_pcs !== null) {
+              if (product.stok_pcs < qtySisa) {
+                res.status(422).json({ error: `Stok produk satuan ${product.nama_produk} tidak mencukupi.` });
+                return;
+              }
+              product.stok_pcs -= qtySisa;
+            }
+            if ((product.satuan_hitung ?? "pcs") === "klik") {
+              luasCetakM2 = round22(qtySisa * A3_PLUS_AREA_M2);
+            }
+          }
+          const klikTotal = (product.satuan_hitung ?? "pcs") === "klik" ? qtySisa * (product.klik_per_lembar ?? 1) : null;
+          const idsTinta = Array.isArray(warna_tinta_ids) ? warna_tinta_ids : [];
+          const tintaPerWarna = catatTintaPerWarna(db, {
+            warnaIds: idsTinta,
+            luasCetakM2,
+            orderItemId: item.id,
+            grupId: null,
+            now
+          });
+          let estimasiTinta = tintaPerWarna.totalMl;
+          let peringatanStok = tintaPerWarna.peringatan;
+          if (idsTinta.length === 0) {
+            estimasiTinta = round22(luasCetakM2 * (machine.konsumsi_tinta_ml_per_m2 ?? 0));
+            if (estimasiTinta > 0) {
+              const ink = selectInkSupply(db, machine);
+              if (!ink) {
+                peringatanStok = "Stok tinta tidak tersedia; estimasi tetap dicatat.";
+              } else {
+                const pakai = round22(Math.min(ink.stok, estimasiTinta));
+                ink.stok = round22(ink.stok - pakai);
+                ink.updated_at = now;
+                db.supply_usages.push({
+                  id: store.nextId("supply_usages"),
+                  supply_id: ink.id,
+                  order_item_id: item.id,
+                  jumlah: pakai,
+                  satuan: ink.satuan,
+                  keterangan: `Estimasi tinta cetak | ${product.nama_produk} | ${machine.nama_mesin}`,
+                  user_id: getCurrentUser(req).id,
+                  created_at: now
+                });
+                if (pakai + 1e-3 < estimasiTinta) {
+                  peringatanStok = `Stok ${ink.nama} hanya ${ink.stok.toLocaleString("id-ID")} ${ink.satuan}; pemakaian dibatasi.`;
+                }
+              }
+            }
+          }
+          item.machine_id = machine.id;
+          item.operator_id = getCurrentUser(req).id;
+          item.klik_total = klikTotal;
+          item.estimasi_tinta_ml = estimasiTinta;
+          item.qty_tercetak = item.qty;
+          item.waktu_mulai_cetak = item.waktu_mulai_cetak ?? now;
+          item.waktu_selesai_cetak = now;
+          item.status_produksi = item.finishing_id ? "antrean_finishing" : "siap_diambil";
+          item.updated_at = now;
+          store.persist();
+          broadcastEvent("production_updated", { orderId: item.order_id });
+          enqueueSiapDiambil(item.order_id);
+          res.json({
+            item: store.hydrateItem(item),
+            estimasi_tinta_ml: estimasiTinta,
+            rincian_tinta: tintaPerWarna.rincian,
+            klik_total: klikTotal,
+            peringatan_stok: peringatanStok
+          });
+        }
+      ),
+      "Gagal menyelesaikan cetak secara transaksional."
+    );
+  });
+  const hydrateGrupCetak = (db, grup) => ({
+    ...grup,
+    operator_name: db.users.find((u) => u.id === grup.operator_id)?.name ?? null,
+    machine_name: db.machines.find((m) => m.id === grup.machine_id)?.nama_mesin ?? null,
+    items: db.cetak_grup_item.filter((gi) => gi.grup_id === grup.id).map((gi) => {
+      const orderItem = db.order_items.find((it) => it.id === gi.order_item_id);
+      return {
+        ...gi,
+        no_nota: orderItem ? db.orders.find((o) => o.id === orderItem.order_id)?.no_nota ?? "-" : "-",
+        nama_item: orderItem?.nama_item ?? null,
+        qty_order: orderItem?.qty ?? 0
+      };
+    })
+  });
+  const prosesSelesaiGrupItem = (db, grup, gi, now, operatorId, warnaIds) => {
+    const item = db.order_items.find((i) => i.id === gi.order_item_id);
+    if (!item) return "Item pesanan tidak ditemukan.";
+    const parentOrder = db.orders.find((o) => o.id === item.order_id);
+    if (!parentOrder || !activeOrderRaw(parentOrder)) return "Nota sudah dibatalkan (void).";
+    const product = db.products.find((p) => p.id === item.product_id);
+    if (!product) return "Produk tidak ditemukan.";
+    const qty = Math.max(1, Math.floor(Number(gi.qty_cetak ?? item.qty ?? 1)));
+    const finishing = item.finishing_id ? db.finishings.find((f) => f.id === item.finishing_id) ?? null : null;
+    const ukuranKotor = computeUkuranKotor(item.lebar_m ?? 0, item.tinggi_m ?? 0, qty, finishing);
+    const panjangFile = Number(gi.panjang_file_m ?? 0) > 0 ? round22(Number(gi.panjang_file_m)) : round22(ukuranKotor.tinggi);
+    const lebarFile = Number(gi.lebar_file_m ?? 0) > 0 ? round22(Number(gi.lebar_file_m)) : round22(ukuranKotor.lebar);
+    const panjangPakai = round22(panjangFile * qty);
+    const luasNetto = round22(panjangFile * lebarFile * qty);
+    const wosFinishing = round22(Math.max(ukuranKotor.luas - luasNetto, 0));
+    if (!(panjangPakai > 0) || !(lebarFile > 0)) return "Dimensi file .prn tidak valid.";
+    const offLebar = Math.max(0, round22(Number(gi.offcut_lebar_m ?? 0)));
+    const offPanjangInput = Math.max(0, round22(Number(gi.offcut_panjang_m ?? 0)));
+    let containerWidthM = 0;
+    let rollId = null;
+    let offcutId = null;
+    let cattoffId = null;
+    if (gi.sumber_bahan === "offcut") {
+      const offcut = gi.offcut_id ? db.material_offcuts.find((o) => o.id === gi.offcut_id) : db.material_offcuts.find((o) => o.status === "tersedia" && o.lebar_m + 1e-3 >= lebarFile && o.panjang_m + 1e-3 >= panjangPakai);
+      if (!offcut || offcut.status !== "tersedia") return "Stok potongan (offcut) tidak tersedia.";
+      if (offcut.lebar_m + 1e-3 < lebarFile) return `Lebar potongan (${offcut.lebar_m} m) kurang dari kebutuhan (${lebarFile} m).`;
+      if (offcut.panjang_m + 1e-3 < panjangPakai) return `Panjang potongan (${offcut.panjang_m} m) kurang dari kebutuhan (${panjangPakai} m).`;
+      offcut.status = "terpakai";
+      offcutId = offcut.id;
+      gi.offcut_id = offcut.id;
+      containerWidthM = offcut.lebar_m;
+    } else if (gi.sumber_bahan === "cattoff") {
+      const cattoff = gi.cattoff_id ? db.stok_cattoff.find((c) => c.id === gi.cattoff_id) : db.stok_cattoff.find((c) => c.status === "aktif" && c.lebar_m + 1e-3 >= lebarFile && c.panjang_sisa_m + 1e-3 >= panjangPakai);
+      if (!cattoff || cattoff.status !== "aktif") return "Stok cattoff aktif tidak tersedia.";
+      if (cattoff.lebar_m + 1e-3 < lebarFile) return `Lebar cattoff (${cattoff.lebar_m} m) kurang dari kebutuhan (${lebarFile} m).`;
+      if (cattoff.panjang_sisa_m + 1e-3 < panjangPakai) return `Sisa cattoff (${cattoff.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).`;
+      const sisa = round22(cattoff.panjang_sisa_m - panjangPakai);
+      cattoff.panjang_sisa_m = sisa;
+      cattoff.status = sisa <= 0 ? "habis" : "aktif";
+      cattoff.updated_at = now;
+      cattoffId = cattoff.id;
+      gi.cattoff_id = cattoff.id;
+      containerWidthM = cattoff.lebar_m;
+    } else {
+      const roll = gi.roll_id ? db.material_rolls.find((r) => r.id === gi.roll_id) : db.material_rolls.find((r) => r.status === "aktif" && r.lebar_m + 1e-3 >= lebarFile && r.panjang_sisa_m + 1e-3 >= panjangPakai);
+      if (!roll || roll.status !== "aktif") return "Roll bahan aktif tidak tersedia.";
+      if (roll.lebar_m + 1e-3 < lebarFile) return `Lebar roll (${roll.lebar_m} m) kurang dari kebutuhan (${lebarFile} m).`;
+      if (roll.panjang_sisa_m + 1e-3 < panjangPakai) return `Sisa roll (${roll.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).`;
+      const sisa = round22(roll.panjang_sisa_m - panjangPakai);
+      roll.panjang_sisa_m = sisa;
+      roll.status = sisa <= 0 ? "habis" : "aktif";
+      rollId = roll.id;
+      gi.roll_id = roll.id;
+      containerWidthM = roll.lebar_m;
     }
-    const { material_roll_id, panjang_rusak_m, alasan } = req.body;
-    const roll = db.material_rolls.find((r) => r.id === Number(material_roll_id));
-    if (!roll || roll.status !== "aktif") {
-      res.status(422).json({ error: "Pilih roll aktif yang mengalami gagal cetak." });
-      return;
+    const offPanjang = offPanjangInput > 0 ? offPanjangInput : offLebar > 0 ? panjangPakai : 0;
+    const hitungBahan = hitungPemakaianBahanPrn({
+      panjangFileM: panjangPakai,
+      lebarFileM: lebarFile,
+      containerWidthM,
+      manualOffcutLebarM: offLebar,
+      manualOffcutPanjangM: offPanjang
+    });
+    if (hitungBahan.createsManualOffcut) {
+      const sourceRoll = rollId ? db.material_rolls.find((r) => r.id === rollId) : null;
+      const sourceCattoff = cattoffId ? db.stok_cattoff.find((c) => c.id === cattoffId) : null;
+      db.material_offcuts.push({
+        id: store.nextId("material_offcuts"),
+        material_roll_id: rollId,
+        kode_roll: sourceRoll?.kode_roll ?? sourceCattoff?.kode ?? null,
+        jenis_bahan: sourceRoll?.jenis_bahan ?? sourceCattoff?.jenis_bahan ?? product.nama_produk,
+        lebar_m: offLebar,
+        panjang_m: offPanjang,
+        luas_m2: round22(offLebar * offPanjang),
+        status: "tersedia",
+        created_at: now
+      });
+      offcutId = db.material_offcuts[db.material_offcuts.length - 1].id;
+      gi.offcut_id = offcutId;
     }
-    const panjangRusak = round2(Number(panjang_rusak_m ?? 0));
-    if (!(panjangRusak > 0)) {
-      res.status(422).json({ error: "Panjang bahan rusak wajib lebih dari 0 meter." });
-      return;
-    }
-    if (roll.panjang_sisa_m + 1e-3 < panjangRusak) {
-      res.status(422).json({ error: "Panjang rusak melebihi sisa roll aktif." });
-      return;
-    }
-    const sisa = round2(roll.panjang_sisa_m - panjangRusak);
-    roll.panjang_sisa_m = sisa;
-    roll.status = sisa <= 0 ? "habis" : "aktif";
-    const luasRusak = round2(roll.lebar_m * panjangRusak);
     db.material_logs.push({
       id: store.nextId("material_logs"),
       order_item_id: item.id,
-      material_roll_id: roll.id,
-      material_offcut_id: null,
-      luas_netto_m2: 0,
-      wos_finishing_m2: 0,
-      wos_potong_m2: 0,
-      gagal_cetak_m2: luasRusak,
-      keterangan: `Gagal cetak | Roll ${roll.kode_roll} | ${panjangRusak} m${alasan ? ` (${alasan})` : ""}`,
-      created_at: (/* @__PURE__ */ new Date()).toISOString()
+      material_roll_id: rollId,
+      material_offcut_id: offcutId,
+      luas_netto_m2: luasNetto,
+      wos_finishing_m2: wosFinishing,
+      wos_potong_m2: hitungBahan.wosPotongM2,
+      gagal_cetak_m2: 0,
+      keterangan: `Selesai cetak grup ${grup.kode_grup} | ${product.nama_produk} | ${panjangPakai} m`,
+      created_at: now
     });
+    const tinta = catatTintaPerWarna(db, {
+      warnaIds,
+      luasCetakM2: luasNetto,
+      orderItemId: item.id,
+      grupId: grup.id,
+      now
+    });
+    gi.masuk_wos_m2 = hitungBahan.wosPotongM2;
+    gi.status = "selesai";
+    gi.updated_at = now;
+    item.qty_tercetak = round22((item.qty_tercetak ?? 0) + qty);
+    item.machine_id = grup.machine_id;
+    item.operator_id = operatorId;
+    item.estimasi_tinta_ml = round22((item.estimasi_tinta_ml ?? 0) + tinta.totalMl);
+    item.waktu_mulai_cetak = item.waktu_mulai_cetak ?? now;
+    item.updated_at = now;
+    const statusCetak = statusSetelahCetak(item.qty, item.qty_tercetak ?? 0);
+    if (statusCetak === "selesai") {
+      item.waktu_selesai_cetak = now;
+      item.status_produksi = item.finishing_id ? "antrean_finishing" : "siap_diambil";
+      enqueueSiapDiambil(item.order_id);
+    } else {
+      item.status_produksi = "antrean_cetak";
+    }
+    return null;
+  };
+  app.post("/api/operator/grup", requireAuth(["operator_cetak"]), async (req, res) => {
+    const operator = getCurrentUser(req);
+    const body = req.body;
+    const itemIds = [...new Set((body.item_ids ?? []).map((id) => parsePositiveId(id)).filter((id) => id !== null))];
+    if (itemIds.length === 0) {
+      res.status(422).json({ error: "Pilih minimal satu item untuk grup cetak." });
+      return;
+    }
+    let grupId = null;
+    await store.critical(
+      ["order_items", "cetak_grup", "cetak_grup_item", "audit_logs"],
+      () => {
+        const db2 = store.getState();
+        const items = itemIds.map((id2) => db2.order_items.find((it) => it.id === id2)).filter((it) => Boolean(it));
+        if (items.length === 0) {
+          res.status(422).json({ error: "Item grup tidak ditemukan." });
+          return;
+        }
+        const nonMeteran = items.find((it) => db2.products.find((p) => p.id === it.product_id)?.kategori_produk !== "meteran");
+        if (nonMeteran) {
+          res.status(422).json({ error: "Grup cetak hanya untuk produk meteran." });
+          return;
+        }
+        const tidakSiap = items.find(
+          (it) => !["antrean_cetak", "siap_tata", "proses_cetak", "cetak_ulang"].includes(it.status_produksi)
+        );
+        if (tidakSiap) {
+          res.status(422).json({ error: `Item ${tidakSiap.nama_item ?? tidakSiap.id} tidak berada di antrean cetak.` });
+          return;
+        }
+        const sudahDigrup = items.find(
+          (it) => db2.cetak_grup_item.some((gi) => gi.order_item_id === it.id && gi.status !== "selesai")
+        );
+        if (sudahDigrup) {
+          res.status(422).json({ error: `Item ${sudahDigrup.nama_item ?? sudahDigrup.id} masih ada di grup cetak yang belum selesai.` });
+          return;
+        }
+        const notaBatal = items.find((it) => {
+          const order = db2.orders.find((o) => o.id === it.order_id);
+          return !order || !activeOrderRaw(order);
+        });
+        if (notaBatal) {
+          res.status(422).json({ error: "Nota item sudah dibatalkan (void)." });
+          return;
+        }
+        const product = db2.products.find((p) => p.id === items[0].product_id);
+        const machine = mesinUtamaCetak(db2, product);
+        if (!machine) {
+          res.status(422).json({ error: "Mesin cetak aktif belum tersedia." });
+          return;
+        }
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const id = store.nextId("cetak_grup");
+        const grup2 = {
+          id,
+          kode_grup: `GRP-${now.slice(0, 10).replace(/-/g, "")}-${id}`,
+          operator_id: operator.id,
+          machine_id: machine.id,
+          status: "menunggu",
+          tanggal: now.slice(0, 10),
+          catatan: body.catatan?.trim() || null,
+          created_at: now,
+          updated_at: now
+        };
+        db2.cetak_grup.push(grup2);
+        for (const it of items) {
+          db2.cetak_grup_item.push({
+            id: store.nextId("cetak_grup_item"),
+            grup_id: id,
+            order_item_id: it.id,
+            qty_cetak: Math.max(1, it.qty - (it.qty_tercetak ?? 0)),
+            panjang_file_m: null,
+            lebar_file_m: null,
+            sumber_bahan: "roll",
+            roll_id: null,
+            cattoff_id: null,
+            offcut_id: null,
+            offcut_lebar_m: null,
+            offcut_panjang_m: null,
+            masuk_wos_m2: 0,
+            status: "menunggu",
+            catatan: null,
+            updated_at: now
+          });
+          it.status_produksi = "siap_tata";
+          it.ditata_at = now;
+          it.machine_id = machine.id;
+          it.operator_id = operator.id;
+          it.updated_at = now;
+        }
+        grupId = id;
+        store.persist();
+        auditRequest(req, "operator_grup_dibuat", "cetak_grup", id, `${operator.name} membuat grup ${grup2.kode_grup} (${items.length} item).`);
+        broadcastEvent("production_updated", { orderId: items[0].order_id });
+      }
+    );
+    if (!grupId) return;
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === grupId);
+    if (!grup) {
+      res.status(500).json({ error: "Grup cetak gagal dibuat." });
+      return;
+    }
+    res.json({ grup: hydrateGrupCetak(db, grup) });
+  });
+  app.patch("/api/operator/grup/:id/item/:itemId", requireAuth(["operator_cetak"]), (req, res) => {
+    const body = req.body;
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === parsePositiveId(req.params.id));
+    const gi = db.cetak_grup_item.find((row) => row.id === parsePositiveId(req.params.itemId));
+    if (!grup || !gi || gi.grup_id !== grup.id) {
+      res.status(404).json({ error: "Item grup tidak ditemukan." });
+      return;
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    if (body.qty_cetak !== void 0) gi.qty_cetak = Math.max(1, Math.floor(Number(body.qty_cetak)));
+    if (body.panjang_file_m !== void 0) gi.panjang_file_m = Number(body.panjang_file_m) > 0 ? round22(Number(body.panjang_file_m)) : null;
+    if (body.lebar_file_m !== void 0) gi.lebar_file_m = Number(body.lebar_file_m) > 0 ? round22(Number(body.lebar_file_m)) : null;
+    if (body.sumber_bahan !== void 0 && ["roll", "cattoff", "offcut"].includes(body.sumber_bahan)) {
+      gi.sumber_bahan = body.sumber_bahan;
+    }
+    if (body.roll_id !== void 0) gi.roll_id = body.roll_id;
+    if (body.cattoff_id !== void 0) gi.cattoff_id = body.cattoff_id;
+    if (body.offcut_id !== void 0) gi.offcut_id = body.offcut_id;
+    if (body.offcut_lebar_m !== void 0) gi.offcut_lebar_m = Number(body.offcut_lebar_m) > 0 ? round22(Number(body.offcut_lebar_m)) : null;
+    if (body.offcut_panjang_m !== void 0) gi.offcut_panjang_m = Number(body.offcut_panjang_m) > 0 ? round22(Number(body.offcut_panjang_m)) : null;
+    if (body.status !== void 0 && ["menunggu", "selesai", "kendala"].includes(body.status)) gi.status = body.status;
+    if (body.catatan !== void 0) gi.catatan = body.catatan?.trim() || null;
+    gi.updated_at = now;
+    if (grup.status === "menunggu") grup.status = "dalam_proses";
+    grup.updated_at = now;
     store.persist();
-    broadcastEvent("stock_updated", { orderId: item.order_id });
-    res.json({ message: "Gagal cetak dicatat ke audit bahan tanpa mengubah tagihan pelanggan." });
+    res.json({ grup: hydrateGrupCetak(db, grup) });
+  });
+  app.post("/api/operator/grup/:id/selesai-item", requireAuth(["operator_cetak"]), async (req, res) => {
+    const operator = getCurrentUser(req);
+    const gid = parsePositiveId(req.params.id);
+    const body = req.body;
+    const giId = parsePositiveId(body.cetak_grup_item_id);
+    if (!gid || !giId) {
+      res.status(422).json({ error: "Item grup tidak valid." });
+      return;
+    }
+    const warnaIds = Array.isArray(body.warna_tinta_ids) ? body.warna_tinta_ids : [];
+    try {
+      await store.critical(
+        [
+          "order_items",
+          "material_rolls",
+          "material_offcuts",
+          "stok_cattoff",
+          "tinta_warna",
+          "pemakaian_tinta",
+          "material_logs",
+          "cetak_grup",
+          "cetak_grup_item",
+          "audit_logs"
+        ],
+        () => {
+          const db2 = store.getState();
+          const grup2 = db2.cetak_grup.find((g) => g.id === gid);
+          const gi = db2.cetak_grup_item.find((row) => row.id === giId && row.grup_id === gid);
+          if (!grup2 || !gi) throw new Error("HTTP422:Item grup tidak ditemukan.");
+          if (gi.status === "selesai") throw new Error("HTTP422:Item grup sudah diselesaikan.");
+          const now = (/* @__PURE__ */ new Date()).toISOString();
+          const error = prosesSelesaiGrupItem(db2, grup2, gi, now, operator.id, warnaIds);
+          if (error) throw new Error(`HTTP422:${error}`);
+          const tersisa = db2.cetak_grup_item.some((row) => row.grup_id === gid && row.status !== "selesai");
+          grup2.status = tersisa ? "dalam_proses" : "selesai";
+          grup2.updated_at = now;
+          store.persist();
+          auditRequest(req, "operator_grup_item_selesai", "cetak_grup", gid, `${operator.name} menyelesaikan ${gi.qty_cetak} cetakan item ${gi.order_item_id}.`);
+        }
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith("HTTP422:")) {
+        res.status(422).json({ error: message.slice("HTTP422:".length) });
+        return;
+      }
+      res.status(500).json({ error: "Gagal menyelesaikan item grup secara transaksional." });
+      return;
+    }
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === gid);
+    res.json({ grup: grup ? hydrateGrupCetak(db, grup) : null });
+  });
+  app.post("/api/operator/grup/:id/selesai", requireAuth(["operator_cetak"]), async (req, res) => {
+    const operator = getCurrentUser(req);
+    const gid = parsePositiveId(req.params.id);
+    if (!gid) {
+      res.status(422).json({ error: "Grup tidak valid." });
+      return;
+    }
+    const warnaIds = Array.isArray(req.body.warna_tinta_ids) ? req.body.warna_tinta_ids.map(Number).filter((id) => Number.isInteger(id) && id > 0) : [];
+    try {
+      await store.critical(
+        [
+          "order_items",
+          "material_rolls",
+          "material_offcuts",
+          "stok_cattoff",
+          "tinta_warna",
+          "pemakaian_tinta",
+          "material_logs",
+          "cetak_grup",
+          "cetak_grup_item",
+          "audit_logs"
+        ],
+        () => {
+          const db2 = store.getState();
+          const grup2 = db2.cetak_grup.find((g) => g.id === gid);
+          if (!grup2) throw new Error("HTTP422:Grup cetak tidak ditemukan.");
+          const now = (/* @__PURE__ */ new Date()).toISOString();
+          const rows = db2.cetak_grup_item.filter((gi) => gi.grup_id === gid && gi.status !== "selesai");
+          if (rows.length === 0) throw new Error("HTTP422:Tidak ada item grup yang perlu diselesaikan.");
+          for (const gi of rows) {
+            const error = prosesSelesaiGrupItem(db2, grup2, gi, now, operator.id, warnaIds);
+            if (error) throw new Error(`HTTP422:${error}`);
+          }
+          grup2.status = "selesai";
+          grup2.updated_at = now;
+          store.persist();
+          auditRequest(req, "operator_grup_selesai", "cetak_grup", gid, `${operator.name} menyelesaikan grup ${grup2.kode_grup} (${rows.length} item).`);
+        }
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith("HTTP422:")) {
+        res.status(422).json({ error: message.slice("HTTP422:".length) });
+        return;
+      }
+      res.status(500).json({ error: "Gagal menyelesaikan grup secara transaksional." });
+      return;
+    }
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === gid);
+    res.json({ grup: grup ? hydrateGrupCetak(db, grup) : null });
+  });
+  app.post("/api/operator/items/:id/gagal-cetak", requireAuth(["operator_cetak"]), async (req, res) => {
+    await runTransactional(
+      res,
+      () => store.critical(["order_items", "material_rolls"], () => {
+        const db = store.getState();
+        const item = db.order_items.find((i) => i.id === Number(req.params.id));
+        if (!item) {
+          res.status(404).json({ error: "Item tidak ditemukan." });
+          return;
+        }
+        if (item.status_produksi === "gagal_cetak") {
+          res.status(422).json({ error: "Item berstatus Gagal Cetak wajib dimulai cetak ulang sebelum diselesaikan." });
+          return;
+        }
+        if (!["antrean_cetak", "siap_tata", "proses_cetak", "cetak_ulang"].includes(item.status_produksi)) {
+          res.status(403).json({ error: "Item tidak berada di antrean cetak." });
+          return;
+        }
+        const { material_roll_id, panjang_rusak_m, alasan } = req.body;
+        const roll = db.material_rolls.find((r) => r.id === Number(material_roll_id));
+        if (!roll || roll.status !== "aktif") {
+          res.status(422).json({ error: "Pilih roll aktif yang mengalami gagal cetak." });
+          return;
+        }
+        const panjangRusak = round22(Number(panjang_rusak_m ?? 0));
+        if (!(panjangRusak > 0)) {
+          res.status(422).json({ error: "Panjang bahan rusak wajib lebih dari 0 meter." });
+          return;
+        }
+        if (roll.panjang_sisa_m + 1e-3 < panjangRusak) {
+          res.status(422).json({ error: "Panjang rusak melebihi sisa roll aktif." });
+          return;
+        }
+        const sisa = round22(roll.panjang_sisa_m - panjangRusak);
+        roll.panjang_sisa_m = sisa;
+        roll.status = sisa <= 0 ? "habis" : "aktif";
+        const luasRusak = round22(roll.lebar_m * panjangRusak);
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        db.material_logs.push({
+          id: store.nextId("material_logs"),
+          order_item_id: item.id,
+          material_roll_id: roll.id,
+          material_offcut_id: null,
+          luas_netto_m2: 0,
+          wos_finishing_m2: 0,
+          wos_potong_m2: 0,
+          gagal_cetak_m2: luasRusak,
+          keterangan: `Gagal cetak | Roll ${roll.kode_roll} | ${panjangRusak} m${alasan ? ` (${alasan})` : ""}`,
+          created_at: now
+        });
+        item.status_produksi = "gagal_cetak";
+        item.waktu_mulai_cetak = null;
+        item.waktu_selesai_cetak = null;
+        item.updated_at = now;
+        auditRequest(req, "print_failed", "order_item", item.id, `Gagal cetak: ${alasan || "tanpa alasan"}. Roll ${roll.kode_roll} -${panjangRusak}m.`);
+        store.persist();
+        broadcastEvent("stock_updated", { orderId: item.order_id });
+        broadcastEvent("production_updated", { orderId: item.order_id });
+        res.json({ message: "Gagal cetak dicatat. Item dikembalikan ke antrean cetak untuk reprint.", item: store.hydrateItem(item) });
+      }),
+      "Gagal mencatat gagal cetak secara transaksional."
+    );
   });
   app.get("/api/operator/batches", requireAuth(["operator_cetak", "owner"]), (_req, res) => {
     const db = store.getState();
@@ -4920,52 +7090,90 @@ ${text}`,
     });
     res.json({ items });
   });
-  app.post("/api/finishing/items/:id/konfirmasi", requireAuth(["finishing"]), (req, res) => {
+  app.post("/api/finishing/items/:id/qc", requireAuth(["finishing"]), uploadPhoto.single("foto"), (req, res) => {
     const user = getCurrentUser(req);
     const db = store.getState();
-    const item = db.order_items.find((i) => i.id === Number(req.params.id));
+    const item = db.order_items.find((i) => i.id === parsePositiveId(req.params.id));
+    if (!item) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(404).json({ error: "Item tidak ditemukan." });
+      return;
+    }
+    if (!["antrean_finishing", "proses_finishing"].includes(item.status_produksi)) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(403).json({ error: "Item tidak berada di antrean QC finishing." });
+      return;
+    }
+    const body = req.body ?? {};
+    const hasil = String(body.hasil ?? "").trim();
+    const catatan = String(body.catatan ?? "").trim();
+    const statusQc = resolveQcStatus(hasil);
+    if (!statusQc) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: 'Hasil QC wajib "lolos" atau "cacat".' });
+      return;
+    }
+    if (statusQc === "cetak_ulang" && !catatan) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: "Catatan cacat wajib diisi untuk pengajuan cetak ulang." });
+      return;
+    }
+    if (!req.file) {
+      res.status(422).json({ error: "Foto bukti QC wajib diunggah." });
+      return;
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    item.status_produksi = statusQc;
+    if (statusQc === "cetak_ulang") {
+      item.foto_cetak_ulang = `/uploads/${req.file.filename}`;
+      item.waktu_mulai_cetak = null;
+      item.waktu_selesai_cetak = null;
+      item.machine_id = null;
+      item.operator_id = null;
+      item.qty_tercetak = 0;
+    }
+    item.updated_at = now;
+    auditRequest(
+      req,
+      hasil === "cacat" ? "finishing_qc_cacat" : "finishing_qc_lolos",
+      "order_item",
+      item.id,
+      `QC finishing oleh ${user.name}: ${hasil}${catatan ? ` | ${catatan}` : ""}${hasil === "cacat" ? " | Bukti cacat tersimpan" : ""}`
+    );
+    store.persist();
+    broadcastEvent("production_updated", { orderId: item.order_id });
+    res.json({ item: store.hydrateItem(item) });
+  });
+  app.post("/api/finishing/items/:id/konfirmasi", requireAuth(["finishing"]), uploadPhoto.single("foto"), (req, res) => {
+    const user = getCurrentUser(req);
+    const db = store.getState();
+    const item = db.order_items.find((i) => i.id === parsePositiveId(req.params.id));
     if (!item || !["antrean_finishing", "proses_finishing"].includes(item.status_produksi)) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(403).json({ error: "Item tidak berada di antrean finishing." });
       return;
     }
-    const { bahan_pembantu } = req.body ?? {};
-    const usages = [];
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    for (const row of bahan_pembantu ?? []) {
-      const supply = db.supplies.find(
-        (s) => s.id === Number(row.supply_id) && s.aktif && s.kategori === "bahan_pembantu"
-      );
-      if (!supply) {
-        res.status(422).json({ error: "Bahan pembantu tidak tersedia atau bukan kategori finishing." });
-        return;
-      }
-      const jumlah = round2(Number(row.jumlah ?? 0));
-      if (!(jumlah > 0) || supply.stok + 1e-3 < jumlah) {
-        res.status(422).json({ error: `Stok ${supply.nama} tidak mencukupi (${supply.stok} ${supply.satuan}).` });
-        return;
-      }
-      supply.stok = round2(supply.stok - jumlah);
-      supply.updated_at = now;
-      usages.push({
-        id: store.nextId("supply_usages"),
-        supply_id: supply.id,
-        order_item_id: item.id,
-        jumlah,
-        satuan: supply.satuan,
-        keterangan: `Finishing | ${supply.nama}`,
-        user_id: user.id,
-        created_at: now
-      });
+    if (!req.file) {
+      res.status(422).json({ error: "Foto bukti finishing wajib diunggah." });
+      return;
     }
-    db.supply_usages.push(...usages);
+    const catatan = String(req.body.catatan ?? "").trim();
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    item.foto_finishing = `/uploads/${req.file.filename}`;
     item.finishing_user_id = user.id;
     item.status_produksi = "siap_diambil";
     item.updated_at = now;
-    auditRequest(req, "finishing_done", "order_item", item.id, `Finishing diselesaikan oleh ${user.name}${usages.length ? ` dengan ${usages.length} bahan pembantu` : ""}.`);
+    auditRequest(
+      req,
+      "finishing_done",
+      "order_item",
+      item.id,
+      `Finishing diselesaikan oleh ${user.name} dengan bukti foto${catatan ? ` | ${catatan}` : ""}.`
+    );
     store.persist();
     broadcastEvent("production_updated", { orderId: item.order_id });
     enqueueSiapDiambil(item.order_id);
-    res.json({ item: store.hydrateItem(item), bahan_pembantu: usages.map((u) => ({ ...u, supply_name: db.supplies.find((s) => s.id === u.supply_id)?.nama ?? null })) });
+    res.json({ item: store.hydrateItem(item), foto_finishing: item.foto_finishing });
   });
   app.get("/api/advertising/spks", requireAuth(["advertising", "owner", "admin"]), (req, res) => {
     const db = store.getState();
@@ -5047,7 +7255,7 @@ ${text}`,
         res.status(403).json({ error: "Nota ini belum siap diambil atau sudah diserahkan." });
         return;
       }
-      const { nama_pengambil, no_wa_pengambil, catatan_pengecualian, tanda_tangan_pengambil } = req.body;
+      const { nama_pengambil, no_wa_pengambil, catatan_pengecualian, tanda_tangan_pengambil, kurir_nama, resi_pengiriman } = req.body;
       if (!nama_pengambil?.trim() || !no_wa_pengambil?.trim()) {
         res.status(422).json({ error: "Nama pengambil dan No. WhatsApp pengambil wajib diisi." });
         return;
@@ -5064,6 +7272,8 @@ ${text}`,
       const now = (/* @__PURE__ */ new Date()).toISOString();
       order.nama_pengambil = nama_pengambil.trim();
       order.no_wa_pengambil = no_wa_pengambil.trim();
+      order.kurir_nama = kurir_nama?.trim() || null;
+      order.resi_pengiriman = resi_pengiriman?.trim() || null;
       order.waktu_serah_terima = now;
       order.tanda_tangan_pengambil = signature;
       if (req.file) {
@@ -5086,6 +7296,7 @@ ${text}`,
     }
   );
   app.get("/api/riwayat/:divisi", requireAuth(), (req, res) => {
+    const actor = getCurrentUser(req);
     const db = store.getState();
     const divisi = req.params.divisi;
     const q = String(req.query.q ?? "").trim().toLowerCase();
@@ -5101,7 +7312,15 @@ ${text}`,
         (o) => o.items.some((i) => i.finishing_id !== null && ["siap_diambil", "selesai"].includes(i.status_produksi))
       );
     } else if (divisi === "advertising") {
-      orders = orders.filter((o) => o.advertising_spks.some((s) => s.status_lapangan === "selesai")).map((o) => ({
+      orders = orders.filter((o) => o.advertising_spks.some((s) => s.status_lapangan === "selesai"));
+    }
+    if (q) {
+      orders = orders.filter(
+        (o) => o.no_nota.toLowerCase().includes(q) || (o.customer?.instansi ?? "").toLowerCase().includes(q) || (o.customer?.nama_pelanggan ?? "").toLowerCase().includes(q)
+      );
+    }
+    if (actor.role === "advertising") {
+      orders = orders.map((o) => ({
         ...o,
         total_tagihan: 0,
         jumlah_dp: 0,
@@ -5109,11 +7328,6 @@ ${text}`,
         payments: [],
         items: o.items.map((i) => ({ ...i, harga_satuan_dipakai: 0, subtotal: 0 }))
       }));
-    }
-    if (q) {
-      orders = orders.filter(
-        (o) => o.no_nota.toLowerCase().includes(q) || (o.customer?.instansi ?? "").toLowerCase().includes(q) || (o.customer?.nama_pelanggan ?? "").toLowerCase().includes(q)
-      );
     }
     res.json({ orders });
   });
@@ -5276,12 +7490,12 @@ ${text}`,
     const payments = db.order_payments.filter(
       (p) => activeOrderIds.has(p.order_id) && inRange(p.created_at)
     );
-    const sumBy = (metode) => round2(payments.filter((p) => p.metode === metode).reduce((s, p) => s + p.nominal, 0));
+    const sumBy = (metode) => round22(payments.filter((p) => p.metode === metode).reduce((s, p) => s + p.nominal, 0));
     const cashflow = {
       tunai: sumBy("Tunai"),
       transfer: sumBy("Transfer"),
       qris: sumBy("QRIS"),
-      total: round2(payments.reduce((s, p) => s + p.nominal, 0)),
+      total: round22(payments.reduce((s, p) => s + p.nominal, 0)),
       jumlah_transaksi: payments.length
     };
     const dailyMap = /* @__PURE__ */ new Map();
@@ -5291,10 +7505,10 @@ ${text}`,
         dailyMap.set(key, { tanggal: key, tunai: 0, transfer: 0, qris: 0, total: 0 });
       }
       const row = dailyMap.get(key);
-      if (p.metode === "Tunai") row.tunai = round2(row.tunai + p.nominal);
-      if (p.metode === "Transfer") row.transfer = round2(row.transfer + p.nominal);
-      if (p.metode === "QRIS") row.qris = round2(row.qris + p.nominal);
-      row.total = round2(row.total + p.nominal);
+      if (p.metode === "Tunai") row.tunai = round22(row.tunai + p.nominal);
+      if (p.metode === "Transfer") row.transfer = round22(row.transfer + p.nominal);
+      if (p.metode === "QRIS") row.qris = round22(row.qris + p.nominal);
+      row.total = round22(row.total + p.nominal);
     }
     const cashflowHarian = Array.from(dailyMap.values()).sort((a, b) => a.tanggal.localeCompare(b.tanggal));
     const today = /* @__PURE__ */ new Date();
@@ -5316,12 +7530,12 @@ ${text}`,
       };
     }).sort((a, b) => b.umur_hari - a.umur_hari);
     const aging = {
-      lancar: round2(piutang.filter((p) => p.bucket === "lancar").reduce((s, p) => s + p.sisa_tagihan, 0)),
-      "1-30": round2(piutang.filter((p) => p.bucket === "1-30").reduce((s, p) => s + p.sisa_tagihan, 0)),
-      "31-60": round2(piutang.filter((p) => p.bucket === "31-60").reduce((s, p) => s + p.sisa_tagihan, 0)),
-      "61-90": round2(piutang.filter((p) => p.bucket === "61-90").reduce((s, p) => s + p.sisa_tagihan, 0)),
-      ">90": round2(piutang.filter((p) => p.bucket === ">90").reduce((s, p) => s + p.sisa_tagihan, 0)),
-      total: round2(piutang.reduce((s, p) => s + p.sisa_tagihan, 0))
+      lancar: round22(piutang.filter((p) => p.bucket === "lancar").reduce((s, p) => s + p.sisa_tagihan, 0)),
+      "1-30": round22(piutang.filter((p) => p.bucket === "1-30").reduce((s, p) => s + p.sisa_tagihan, 0)),
+      "31-60": round22(piutang.filter((p) => p.bucket === "31-60").reduce((s, p) => s + p.sisa_tagihan, 0)),
+      "61-90": round22(piutang.filter((p) => p.bucket === "61-90").reduce((s, p) => s + p.sisa_tagihan, 0)),
+      ">90": round22(piutang.filter((p) => p.bucket === ">90").reduce((s, p) => s + p.sisa_tagihan, 0)),
+      total: round22(piutang.reduce((s, p) => s + p.sisa_tagihan, 0))
     };
     const marginMap = /* @__PURE__ */ new Map();
     for (const item of db.order_items) {
@@ -5334,14 +7548,14 @@ ${text}`,
       }
       const row = marginMap.get(key);
       const qtyBasis = product.kategori_produk === "meteran" ? item.luas_tagihan_m2 ?? 0 : item.qty;
-      row.qty = round2(row.qty + qtyBasis);
-      row.omzet = round2(row.omzet + item.subtotal);
-      row.hpp = round2(row.hpp + qtyBasis * product.harga_modal);
+      row.qty = round22(row.qty + qtyBasis);
+      row.omzet = round22(row.omzet + item.subtotal);
+      row.hpp = round22(row.hpp + qtyBasis * product.harga_modal);
     }
     const margins = Array.from(marginMap.values()).map((row) => ({
       ...row,
-      margin: round2(row.omzet - row.hpp),
-      margin_persen: row.omzet > 0 ? round2((row.omzet - row.hpp) / row.omzet * 100) : 0
+      margin: round22(row.omzet - row.hpp),
+      margin_persen: row.omzet > 0 ? round22((row.omzet - row.hpp) / row.omzet * 100) : 0
     })).sort((a, b) => b.margin - a.margin);
     const komisiPersen = Math.max(0, Number(process.env.KOMISI_PERSEN ?? 1));
     const commissionMap = /* @__PURE__ */ new Map();
@@ -5359,13 +7573,13 @@ ${text}`,
       }
       const row = commissionMap.get(o.user_id);
       row.jumlah_nota += 1;
-      row.omzet = round2(row.omzet + o.total_tagihan);
+      row.omzet = round22(row.omzet + o.total_tagihan);
     }
-    const komisi = Array.from(commissionMap.values()).map((row) => ({ ...row, komisi: round2(row.omzet * komisiPersen / 100) })).sort((a, b) => b.komisi - a.komisi);
+    const komisi = Array.from(commissionMap.values()).map((row) => ({ ...row, komisi: round22(row.omzet * komisiPersen / 100) })).sort((a, b) => b.komisi - a.komisi);
     const expenses = db.operational_expenses.filter((e) => (!dari || e.tanggal >= dari) && (!sampai || e.tanggal <= sampai));
-    const omzet = round2(rangeOrders.reduce((s, o) => s + o.total_tagihan, 0));
-    const hpp = round2(margins.reduce((s, m) => s + m.hpp, 0));
-    const totalOperasional = round2(expenses.reduce((s, e) => s + e.nominal, 0));
+    const omzet = round22(rangeOrders.reduce((s, o) => s + o.total_tagihan, 0));
+    const hpp = round22(margins.reduce((s, m) => s + m.hpp, 0));
+    const totalOperasional = round22(expenses.reduce((s, e) => s + e.nominal, 0));
     res.json({
       dari,
       sampai,
@@ -5375,9 +7589,9 @@ ${text}`,
         cash_masuk: cashflow.total,
         piutang: aging.total,
         hpp,
-        laba_kotor: round2(omzet - hpp),
+        laba_kotor: round22(omzet - hpp),
         total_operasional: totalOperasional,
-        laba_bersih: round2(omzet - hpp - totalOperasional),
+        laba_bersih: round22(omzet - hpp - totalOperasional),
         komisi_persen: komisiPersen
       },
       cashflow,
@@ -5385,10 +7599,10 @@ ${text}`,
       aging,
       piutang,
       hutang: {
-        total: round2(
-          db.purchase_orders.filter((po) => po.status === "diterima").reduce((s, po) => s + Math.max(0, round2(po.total - (po.sudah_dibayar ?? 0))), 0)
+        total: round22(
+          db.purchase_orders.filter((po) => po.status === "diterima").reduce((s, po) => s + Math.max(0, round22(po.total - (po.sudah_dibayar ?? 0))), 0)
         ),
-        items: db.purchase_orders.filter((po) => po.status === "diterima" && round2(po.total - (po.sudah_dibayar ?? 0)) > 0).map((po) => {
+        items: db.purchase_orders.filter((po) => po.status === "diterima" && round22(po.total - (po.sudah_dibayar ?? 0)) > 0).map((po) => {
           const due = po.expected_at ? new Date(po.expected_at) : new Date(new Date(po.tanggal).getTime() + 30 * 864e5);
           const umurHari = Math.floor((today.getTime() - due.getTime()) / 864e5);
           return {
@@ -5397,7 +7611,7 @@ ${text}`,
             supplier: db.suppliers.find((s) => s.id === po.supplier_id)?.nama_supplier ?? "-",
             total: po.total,
             dibayar: po.sudah_dibayar ?? 0,
-            sisa: round2(po.total - (po.sudah_dibayar ?? 0)),
+            sisa: round22(po.total - (po.sudah_dibayar ?? 0)),
             jatuh_tempo: po.expected_at,
             umur_hari: umurHari
           };
@@ -5467,14 +7681,14 @@ ${text}`,
       );
       filename = `reffo-supplier-${dari ?? "awal"}-${sampai ?? "akhir"}.csv`;
     } else if (type === "po" || type === "hutang") {
-      const rows = db.purchase_orders.filter((po) => inRange(po.tanggal)).filter((po) => type !== "hutang" || po.status === "diterima" && round2(po.total - (po.sudah_dibayar ?? 0)) > 0).map((po) => [
+      const rows = db.purchase_orders.filter((po) => inRange(po.tanggal)).filter((po) => type !== "hutang" || po.status === "diterima" && round22(po.total - (po.sudah_dibayar ?? 0)) > 0).map((po) => [
         po.no_po,
         po.tanggal.slice(0, 10),
         db.suppliers.find((s) => s.id === po.supplier_id)?.nama_supplier ?? "-",
         po.status,
         po.total,
         po.sudah_dibayar ?? 0,
-        round2(po.total - (po.sudah_dibayar ?? 0)),
+        round22(po.total - (po.sudah_dibayar ?? 0)),
         po.expected_at ? po.expected_at.slice(0, 10) : "",
         po.diterima_at ? po.diterima_at.slice(0, 10) : "",
         po.catatan ?? ""
@@ -5609,7 +7823,7 @@ ${text}`,
           o.created_at.slice(0, 10),
           o.customer?.instansi ?? "Perorangan",
           o.customer?.nama_pelanggan ?? "-",
-          round2(o.total_tagihan - (o.ppn_nominal ?? 0) + (o.pph23_nominal ?? 0)),
+          round22(o.total_tagihan - (o.ppn_nominal ?? 0) + (o.pph23_nominal ?? 0)),
           o.diskon_nominal ?? 0,
           o.ppn_nominal ?? 0,
           o.pph23_nominal ?? 0,
@@ -5631,8 +7845,8 @@ ${text}`,
     const db = store.getState();
     const jenis = input.jenis;
     const referensiId = Number(input.referensi_id ?? 0);
-    const qty = round2(Number(input.qty ?? 0));
-    const hargaSatuan = round2(Number(input.harga_satuan ?? 0));
+    const qty = round22(Number(input.qty ?? 0));
+    const hargaSatuan = round22(Number(input.harga_satuan ?? 0));
     if (!jenis || !["roll", "supply", "produk"].includes(jenis)) {
       return { error: "Jenis barang PO tidak valid." };
     }
@@ -5647,7 +7861,7 @@ ${text}`,
       referensi_id: referensiId,
       qty,
       harga_satuan: hargaSatuan,
-      subtotal: round2(qty * hargaSatuan),
+      subtotal: round22(qty * hargaSatuan),
       created_at: now
     };
     if (jenis === "roll") {
@@ -5669,7 +7883,7 @@ ${text}`,
     return {
       ...po,
       supplier_name: db.suppliers.find((s) => s.id === po.supplier_id)?.nama_supplier ?? "-",
-      sisa_hutang: round2(po.total - (po.sudah_dibayar ?? 0))
+      sisa_hutang: round22(po.total - (po.sudah_dibayar ?? 0))
     };
   }
   app.get("/api/owner/suppliers", requireAuth(["owner"]), (_req, res) => {
@@ -5677,7 +7891,7 @@ ${text}`,
     const suppliers = db.suppliers.map((s) => ({
       ...s,
       jumlah_po: db.purchase_orders.filter((po) => po.supplier_id === s.id).length,
-      total_hutang: round2(
+      total_hutang: round22(
         db.purchase_orders.filter((po) => po.supplier_id === s.id && po.status === "diterima").reduce((sum, po) => sum + Math.max(0, po.total - (po.sudah_dibayar ?? 0)), 0)
       )
     })).sort((a, b) => a.kode_supplier.localeCompare(b.kode_supplier));
@@ -5812,7 +8026,7 @@ ${text}`,
       expected_at: body.expected_at ? String(body.expected_at) : null,
       status: "draft",
       catatan: body.catatan ? String(body.catatan).trim() : null,
-      total: round2(items.reduce((sum, item) => sum + item.subtotal, 0)),
+      total: round22(items.reduce((sum, item) => sum + item.subtotal, 0)),
       sudah_dibayar: 0,
       hutang: 0,
       diterima_at: null,
@@ -5860,7 +8074,7 @@ ${text}`,
     po.expected_at = body.expected_at ? String(body.expected_at) : null;
     po.catatan = body.catatan ? String(body.catatan).trim() : null;
     po.items = items;
-    po.total = round2(items.reduce((sum, item) => sum + item.subtotal, 0));
+    po.total = round22(items.reduce((sum, item) => sum + item.subtotal, 0));
     po.updated_at = (/* @__PURE__ */ new Date()).toISOString();
     auditRequest(req, "po_update", "purchase_order", po.id, `PO ${po.no_po} diperbarui.`);
     store.persist();
@@ -5884,56 +8098,62 @@ ${text}`,
     broadcastEvent("purchasing_updated", { purchaseOrderId: po.id });
     res.json({ purchase_order: poWithSupplier(po) });
   });
-  app.post("/api/owner/purchase-orders/:id/terima", requireAuth(["owner"]), (req, res) => {
-    const db = store.getState();
-    const user = getCurrentUser(req);
-    const po = db.purchase_orders.find((p) => p.id === Number(req.params.id));
-    if (!po) {
-      res.status(404).json({ error: "Purchase order tidak ditemukan." });
-      return;
-    }
-    if (po.status !== "dikirim") {
-      res.status(422).json({ error: "Hanya PO yang sudah dikirim yang dapat diterima." });
-      return;
-    }
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    for (const item of po.items) {
-      if (item.jenis === "roll") {
-        const roll = db.material_rolls.find((r) => r.id === item.referensi_id);
-        if (roll) {
-          roll.panjang_sisa_m = round2(roll.panjang_sisa_m + item.qty);
-          if (roll.status === "habis" && roll.panjang_sisa_m > 0) roll.status = "aktif";
+  app.post("/api/owner/purchase-orders/:id/terima", requireAuth(["owner"]), async (req, res) => {
+    await runTransactional(
+      res,
+      () => store.critical(["purchase_orders", "material_rolls", "supplies", "products"], () => {
+        const db = store.getState();
+        const user = getCurrentUser(req);
+        const po = db.purchase_orders.find((p) => p.id === Number(req.params.id));
+        if (!po) {
+          res.status(404).json({ error: "Purchase order tidak ditemukan." });
+          return;
         }
-      } else if (item.jenis === "supply") {
-        const supply = db.supplies.find((s) => s.id === item.referensi_id);
-        if (supply) {
-          supply.stok = round2(supply.stok + item.qty);
-          supply.updated_at = now;
+        if (po.status !== "dikirim") {
+          res.status(422).json({ error: "Hanya PO yang sudah dikirim yang dapat diterima." });
+          return;
         }
-      } else {
-        const product = db.products.find((p) => p.id === item.referensi_id);
-        if (product) product.stok_pcs = round2((product.stok_pcs ?? 0) + item.qty);
-      }
-    }
-    const receipt = {
-      id: store.nextId("goods_receipts"),
-      po_id: po.id,
-      no_po: po.no_po,
-      tanggal: String(req.body.tanggal ?? now.slice(0, 10)),
-      admin_id: user?.id ?? 0,
-      admin_name: user?.name ?? null,
-      catatan: req.body.catatan?.trim() || null,
-      created_at: now
-    };
-    db.goods_receipts.push(receipt);
-    po.status = "diterima";
-    po.diterima_at = now;
-    po.hutang = round2(po.total - (po.sudah_dibayar ?? 0));
-    po.updated_at = now;
-    auditRequest(req, "goods_receipt", "purchase_order", po.id, `PO ${po.no_po} diterima; stok bertambah dan hutang dicatat.`);
-    store.persist();
-    broadcastEvent("purchasing_updated", { purchaseOrderId: po.id });
-    res.json({ purchase_order: poWithSupplier(po), goods_receipt: receipt });
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        for (const item of po.items) {
+          if (item.jenis === "roll") {
+            const roll = db.material_rolls.find((r) => r.id === item.referensi_id);
+            if (roll) {
+              roll.panjang_sisa_m = round22(roll.panjang_sisa_m + item.qty);
+              if (roll.status === "habis" && roll.panjang_sisa_m > 0) roll.status = "aktif";
+            }
+          } else if (item.jenis === "supply") {
+            const supply = db.supplies.find((s) => s.id === item.referensi_id);
+            if (supply) {
+              supply.stok = round22(supply.stok + item.qty);
+              supply.updated_at = now;
+            }
+          } else {
+            const product = db.products.find((p) => p.id === item.referensi_id);
+            if (product) product.stok_pcs = round22((product.stok_pcs ?? 0) + item.qty);
+          }
+        }
+        const receipt = {
+          id: store.nextId("goods_receipts"),
+          po_id: po.id,
+          no_po: po.no_po,
+          tanggal: String(req.body.tanggal ?? now.slice(0, 10)),
+          admin_id: user?.id ?? 0,
+          admin_name: user?.name ?? null,
+          catatan: req.body.catatan?.trim() || null,
+          created_at: now
+        };
+        db.goods_receipts.push(receipt);
+        po.status = "diterima";
+        po.diterima_at = now;
+        po.hutang = round22(po.total - (po.sudah_dibayar ?? 0));
+        po.updated_at = now;
+        auditRequest(req, "goods_receipt", "purchase_order", po.id, `PO ${po.no_po} diterima; stok bertambah dan hutang dicatat.`);
+        store.persist();
+        broadcastEvent("purchasing_updated", { purchaseOrderId: po.id });
+        res.json({ purchase_order: poWithSupplier(po), goods_receipt: receipt });
+      }),
+      "Gagal menerima PO secara transaksional."
+    );
   });
   app.post("/api/owner/purchase-orders/:id/bayar", requireAuth(["owner"]), (req, res) => {
     const db = store.getState();
@@ -5948,8 +8168,8 @@ ${text}`,
       return;
     }
     const body = req.body;
-    const nominal = round2(Number(body.nominal ?? 0));
-    const sisa = round2(po.total - (po.sudah_dibayar ?? 0));
+    const nominal = round22(Number(body.nominal ?? 0));
+    const sisa = round22(po.total - (po.sudah_dibayar ?? 0));
     if (!(nominal > 0) || nominal > sisa + 1e-3) {
       res.status(422).json({ error: `Nominal pembayaran harus antara Rp 1 dan sisa hutang Rp ${sisa.toLocaleString("id-ID")}.` });
       return;
@@ -5970,8 +8190,8 @@ ${text}`,
       created_at: now
     };
     db.supplier_payments.push(payment);
-    po.sudah_dibayar = round2((po.sudah_dibayar ?? 0) + nominal);
-    po.hutang = round2(Math.max(0, po.total - po.sudah_dibayar));
+    po.sudah_dibayar = round22((po.sudah_dibayar ?? 0) + nominal);
+    po.hutang = round22(Math.max(0, po.total - po.sudah_dibayar));
     po.updated_at = now;
     auditRequest(req, "supplier_payment", "purchase_order", po.id, `Pembayaran ${payment.metode} Rp ${nominal.toLocaleString("id-ID")} untuk ${po.no_po}.`);
     store.persist();
@@ -6000,10 +8220,11 @@ ${text}`,
     let outbox = [...db.whatsapp_outbox];
     if (status) outbox = outbox.filter((w) => w.status === status);
     outbox.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    const waConfig = getWaConfig();
     res.json({
       outbox: outbox.slice(0, 500),
-      gateway_terkonfigurasi: Boolean(WHATSAPP_WEBHOOK_URL),
-      webhook_url: WHATSAPP_WEBHOOK_URL ? WHATSAPP_WEBHOOK_URL.replace(/\/+$/, "") : null
+      gateway_terkonfigurasi: waConfig.aktif && Boolean(waConfig.url),
+      webhook_url: waConfig.url || null
     });
   });
   app.post("/api/owner/whatsapp-outbox/:id/retry", requireAuth(["owner"]), (req, res) => {
@@ -6015,7 +8236,8 @@ ${text}`,
     }
     row.status = "pending";
     row.attempts = 0;
-    row.last_error = WHATSAPP_WEBHOOK_URL ? null : "Gateway WhatsApp belum dikonfigurasi (WHATSAPP_WEBHOOK_URL).";
+    const waConfig = getWaConfig();
+    row.last_error = waConfig.aktif && waConfig.url ? null : "Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan.";
     row.next_attempt_at = null;
     row.updated_at = (/* @__PURE__ */ new Date()).toISOString();
     auditRequest(req, "whatsapp_retry", "whatsapp_outbox", row.id, `Pesan ${row.event} diantrekan ulang.`);
@@ -6058,7 +8280,10 @@ ${text}`,
       items,
       instansis: semua,
       total_terdaftar: semua.length,
-      gateway_terkonfigurasi: Boolean(WHATSAPP_WEBHOOK_URL)
+      gateway_terkonfigurasi: (() => {
+        const waConfig = getWaConfig();
+        return waConfig.aktif && Boolean(waConfig.url);
+      })()
     });
   });
   app.put("/api/owner/pajak-reklame/:id", requireAuth(["owner"]), (req, res) => {
@@ -6167,15 +8392,15 @@ ${text}`,
       }
       const grp = rekapMap.get(inst);
       grp.total_nota += 1;
-      grp.omzet = round2(grp.omzet + o.total_tagihan);
-      grp.piutang = round2(grp.piutang + o.sisa_tagihan);
+      grp.omzet = round22(grp.omzet + o.total_tagihan);
+      grp.piutang = round22(grp.piutang + o.sisa_tagihan);
       if (!grp.pics.has(pic)) {
         grp.pics.set(pic, { nama: pic, total_nota: 0, omzet: 0, piutang: 0 });
       }
       const p = grp.pics.get(pic);
       p.total_nota += 1;
-      p.omzet = round2(p.omzet + o.total_tagihan);
-      p.piutang = round2(p.piutang + o.sisa_tagihan);
+      p.omzet = round22(p.omzet + o.total_tagihan);
+      p.piutang = round22(p.piutang + o.sisa_tagihan);
     }
     const rekap = Array.from(rekapMap.values()).map((g) => ({ ...g, pics: Array.from(g.pics.values()) })).sort((a, b) => b.omzet - a.omzet);
     const stok_kritis = {
@@ -6189,8 +8414,8 @@ ${text}`,
       rekap,
       total_rekap: {
         nota: orders.length,
-        omzet: round2(orders.reduce((s, o) => s + o.total_tagihan, 0)),
-        piutang: round2(orders.reduce((s, o) => s + o.sisa_tagihan, 0))
+        omzet: round22(orders.reduce((s, o) => s + o.total_tagihan, 0)),
+        piutang: round22(orders.reduce((s, o) => s + o.sisa_tagihan, 0))
       }
     });
   });
@@ -6215,11 +8440,11 @@ ${text}`,
     logs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
     const ringkasan = {
       jumlah_log: logs.length,
-      netto: round2(logs.reduce((s, l) => s + l.luas_netto_m2, 0)),
-      finishing: round2(logs.reduce((s, l) => s + l.wos_finishing_m2, 0)),
-      potong: round2(logs.reduce((s, l) => s + l.wos_potong_m2, 0)),
-      gagal: round2(logs.reduce((s, l) => s + l.gagal_cetak_m2, 0)),
-      total: round2(
+      netto: round22(logs.reduce((s, l) => s + l.luas_netto_m2, 0)),
+      finishing: round22(logs.reduce((s, l) => s + l.wos_finishing_m2, 0)),
+      potong: round22(logs.reduce((s, l) => s + l.wos_potong_m2, 0)),
+      gagal: round22(logs.reduce((s, l) => s + l.gagal_cetak_m2, 0)),
+      total: round22(
         logs.reduce(
           (s, l) => s + l.luas_netto_m2 + l.wos_finishing_m2 + l.wos_potong_m2 + l.gagal_cetak_m2,
           0
@@ -6229,14 +8454,74 @@ ${text}`,
     res.json({
       rolls: db.material_rolls.map((r) => ({
         ...r,
-        luas_sisa_m2: round2(r.lebar_m * r.panjang_sisa_m),
-        persen_sisa: r.panjang_awal_m > 0 ? round2(r.panjang_sisa_m / r.panjang_awal_m * 100) : 0
+        luas_sisa_m2: round22(r.lebar_m * r.panjang_sisa_m),
+        persen_sisa: r.panjang_awal_m > 0 ? round22(r.panjang_sisa_m / r.panjang_awal_m * 100) : 0
       })),
       offcuts: db.material_offcuts.filter((o) => o.status === "tersedia"),
       stok_pcs: db.products.filter((p) => p.kategori_produk === "satuan"),
       ringkasan,
       logs
     });
+  });
+  app.post("/api/owner/stock-opname", requireAuth(["owner"]), (req, res) => {
+    const db = store.getState();
+    const body = req.body ?? {};
+    const tipe = String(body.tipe ?? "").trim();
+    const id = parsePositiveId(body.id);
+    const stokFisik = Number(body.stok_fisik);
+    const catatan = String(body.catatan ?? "").trim();
+    if (!id || !Number.isFinite(stokFisik) || stokFisik < 0) {
+      res.status(422).json({ error: "Data stock opname tidak valid." });
+      return;
+    }
+    if (!catatan) {
+      res.status(422).json({ error: "Catatan stock opname wajib diisi." });
+      return;
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    let before = 0;
+    let after = 0;
+    let label = "";
+    if (tipe === "supply") {
+      const row = db.supplies.find((s) => s.id === id);
+      if (!row) return void res.status(404).json({ error: "Bahan pembantu tidak ditemukan." });
+      before = Number(row.stok ?? 0);
+      after = round22(stokFisik);
+      row.stok = after;
+      row.updated_at = now;
+      label = `supply:${row.nama}`;
+    } else if (tipe === "roll") {
+      const row = db.material_rolls.find((r) => r.id === id);
+      if (!row) return void res.status(404).json({ error: "Roll tidak ditemukan." });
+      before = Number(row.panjang_sisa_m ?? 0);
+      after = round22(stokFisik);
+      row.panjang_sisa_m = after;
+      row.status = after <= 0 ? "habis" : "aktif";
+      label = `roll:${row.kode_roll}`;
+    } else if (tipe === "cattoff") {
+      const row = db.stok_cattoff.find((c) => c.id === id);
+      if (!row) return void res.status(404).json({ error: "Cattoff tidak ditemukan." });
+      before = Number(row.panjang_sisa_m ?? 0);
+      after = round22(stokFisik);
+      row.panjang_sisa_m = after;
+      row.status = after <= 0 ? "habis" : "aktif";
+      row.updated_at = now;
+      label = `cattoff:${row.kode}`;
+    } else if (tipe === "product") {
+      const row = db.products.find((p) => p.id === id);
+      if (!row) return void res.status(404).json({ error: "Produk tidak ditemukan." });
+      before = Number(row.stok_pcs ?? 0);
+      after = Math.max(0, Math.floor(stokFisik));
+      row.stok_pcs = after;
+      label = `product:${row.nama_produk}`;
+    } else {
+      res.status(422).json({ error: "Tipe stock opname tidak didukung." });
+      return;
+    }
+    auditRequest(req, "stock_opname", tipe, id, `Stock opname ${label}: ${before} -> ${after}. ${catatan}`);
+    store.persist();
+    broadcastEvent("domain_update", { tipe, id });
+    res.json({ ok: true, tipe, id, sebelum: before, sesudah: after });
   });
   app.get("/api/owner/reports/profit-loss", requireAuth(["owner"]), (req, res) => {
     const db = store.getState();
@@ -6255,8 +8540,8 @@ ${text}`,
       logs = logs.filter((l) => l.created_at.slice(0, 10) <= sampai);
       expenses = expenses.filter((e) => e.tanggal <= sampai);
     }
-    const omzetTagihan = round2(orders.reduce((s, o) => s + o.total_tagihan, 0));
-    const cashMasuk = round2(orders.reduce((s, o) => s + o.jumlah_dp, 0));
+    const omzetTagihan = round22(orders.reduce((s, o) => s + o.total_tagihan, 0));
+    const cashMasuk = round22(orders.reduce((s, o) => s + o.jumlah_dp, 0));
     const calcKomp = (field) => {
       let luas = 0;
       let biaya = 0;
@@ -6267,7 +8552,7 @@ ${text}`,
         luas += val;
         biaya += val * (prod?.harga_modal ?? 0);
       }
-      return { luas: round2(luas), biaya: round2(biaya) };
+      return { luas: round22(luas), biaya: round22(biaya) };
     };
     const komponen_hpp = {
       netto: calcKomp("luas_netto_m2"),
@@ -6275,11 +8560,11 @@ ${text}`,
       potong: calcKomp("wos_potong_m2"),
       gagal: calcKomp("gagal_cetak_m2")
     };
-    const hppBahan = round2(
+    const hppBahan = round22(
       komponen_hpp.netto.biaya + komponen_hpp.finishing.biaya + komponen_hpp.potong.biaya + komponen_hpp.gagal.biaya
     );
     const orderIds = new Set(orders.map((o) => o.id));
-    const hppSatuan = round2(
+    const hppSatuan = round22(
       db.order_items.filter((i) => orderIds.has(i.order_id)).reduce((sum, i) => {
         const prod = db.products.find((p) => p.id === i.product_id);
         if (prod?.kategori_produk === "satuan") {
@@ -6288,9 +8573,9 @@ ${text}`,
         return sum;
       }, 0)
     );
-    const hppProduksi = round2(hppBahan + hppSatuan);
-    const totalOperasional = round2(expenses.reduce((s, e) => s + e.nominal, 0));
-    const labaBersih = round2(omzetTagihan - hppProduksi - totalOperasional);
+    const hppProduksi = round22(hppBahan + hppSatuan);
+    const totalOperasional = round22(expenses.reduce((s, e) => s + e.nominal, 0));
+    const labaBersih = round22(omzetTagihan - hppProduksi - totalOperasional);
     res.json({
       omzet: { tagihan: omzetTagihan, cash_masuk: cashMasuk, jumlah_nota: orders.length },
       komponen_hpp,
@@ -6314,7 +8599,7 @@ ${text}`,
       tanggal,
       kategori_biaya,
       keterangan: keterangan.trim(),
-      nominal: round2(Number(nominal)),
+      nominal: round22(Number(nominal)),
       created_at: (/* @__PURE__ */ new Date()).toISOString()
     };
     db.operational_expenses.push(expense);
@@ -6340,11 +8625,11 @@ ${text}`,
     for (const row of products ?? []) {
       const target = db.products.find((p) => p.id === Number(row.id));
       if (target) {
-        target.harga_umum = round2(Number(row.harga_umum));
-        target.harga_reseller = round2(Number(row.harga_reseller));
-        target.harga_prioritas = round2(Number(row.harga_prioritas));
-        target.harga_pegawai = round2(Number(row.harga_pegawai));
-        target.harga_modal = round2(Number(row.harga_modal));
+        target.harga_umum = round22(Number(row.harga_umum));
+        target.harga_reseller = round22(Number(row.harga_reseller));
+        target.harga_prioritas = round22(Number(row.harga_prioritas));
+        target.harga_pegawai = round22(Number(row.harga_pegawai));
+        target.harga_modal = round22(Number(row.harga_modal));
         target.mesin_default_id = row.mesin_default_id ? Number(row.mesin_default_id) : null;
         target.satuan_hitung = row.satuan_hitung === "klik" ? "klik" : "pcs";
         target.klik_per_lembar = Math.max(1, Math.floor(Number(row.klik_per_lembar ?? 1)) || 1);
@@ -6406,10 +8691,10 @@ ${text}`,
     for (const row of finishings ?? []) {
       const target = db.finishings.find((f) => f.id === Number(row.id));
       if (target) {
-        target.ekstra_kiri_cm = round2(Number(row.ekstra_kiri_cm));
-        target.ekstra_kanan_cm = round2(Number(row.ekstra_kanan_cm));
-        target.ekstra_atas_cm = round2(Number(row.ekstra_atas_cm));
-        target.ekstra_bawah_cm = round2(Number(row.ekstra_bawah_cm));
+        target.ekstra_kiri_cm = round22(Number(row.ekstra_kiri_cm));
+        target.ekstra_kanan_cm = round22(Number(row.ekstra_kanan_cm));
+        target.ekstra_atas_cm = round22(Number(row.ekstra_atas_cm));
+        target.ekstra_bawah_cm = round22(Number(row.ekstra_bawah_cm));
       }
     }
     store.persist();
@@ -6533,12 +8818,12 @@ ${text}`,
       res.status(404).json({ error: "Barang tidak ditemukan." });
       return;
     }
-    const jumlah = round2(Number(req.body.jumlah ?? 0));
+    const jumlah = round22(Number(req.body.jumlah ?? 0));
     if (!(jumlah > 0)) {
       res.status(422).json({ error: "Jumlah restock wajib lebih dari 0." });
       return;
     }
-    supply.stok = round2(supply.stok + jumlah);
+    supply.stok = round22(supply.stok + jumlah);
     supply.updated_at = (/* @__PURE__ */ new Date()).toISOString();
     auditRequest(req, "supply_restock", "supply", supply.id, `Restock ${supply.nama} sebanyak ${jumlah} ${supply.satuan}.`);
     store.persist();
@@ -6558,10 +8843,10 @@ ${text}`,
         nama: u.name,
         total_job: items.length,
         sukses: items.filter((i) => ["antrean_finishing", "proses_finishing", "siap_diambil", "selesai"].includes(i.status_produksi)).length,
-        luas_sukses_m2: round2(logs.reduce((a, l) => a + l.luas_netto_m2, 0)),
-        luas_gagal_m2: round2(logs.reduce((a, l) => a + l.gagal_cetak_m2, 0)),
+        luas_sukses_m2: round22(logs.reduce((a, l) => a + l.luas_netto_m2, 0)),
+        luas_gagal_m2: round22(logs.reduce((a, l) => a + l.gagal_cetak_m2, 0)),
         total_klik: items.reduce((a, i) => a + (i.klik_total ?? 0), 0),
-        estimasi_tinta_ml: round2(items.reduce((a, i) => a + (i.estimasi_tinta_ml ?? 0), 0))
+        estimasi_tinta_ml: round22(items.reduce((a, i) => a + (i.estimasi_tinta_ml ?? 0), 0))
       };
     });
     const machineStats = db.machines.map((m) => {
@@ -6575,13 +8860,13 @@ ${text}`,
         jenis: m.jenis,
         aktif: m.aktif,
         total_job: items.length,
-        luas_cetak_m2: round2(logs.reduce((a, l) => a + l.luas_netto_m2, 0)),
-        luas_gagal_m2: round2(logs.reduce((a, l) => a + l.gagal_cetak_m2, 0)),
+        luas_cetak_m2: round22(logs.reduce((a, l) => a + l.luas_netto_m2, 0)),
+        luas_gagal_m2: round22(logs.reduce((a, l) => a + l.gagal_cetak_m2, 0)),
         total_klik: items.reduce((a, i) => a + (i.klik_total ?? 0), 0),
-        estimasi_tinta_ml: round2(items.reduce((a, i) => a + (i.estimasi_tinta_ml ?? 0), 0))
+        estimasi_tinta_ml: round22(items.reduce((a, i) => a + (i.estimasi_tinta_ml ?? 0), 0))
       };
     });
-    const lowSupplies = db.supplies.filter((s) => s.aktif && s.stok <= s.stok_minimum).map((s) => ({ ...s, selisih: round2(s.stok - s.stok_minimum) }));
+    const lowSupplies = db.supplies.filter((s) => s.aktif && s.stok <= s.stok_minimum).map((s) => ({ ...s, selisih: round22(s.stok - s.stok_minimum) }));
     const batches = [...db.print_batches].reverse().slice(0, 20).map((b) => ({
       ...b,
       machine_name: db.machines.find((m) => m.id === b.machine_id)?.nama_mesin ?? null,
@@ -6589,6 +8874,108 @@ ${text}`,
     }));
     res.json({ operatorStats, machineStats, lowSupplies, batches });
   });
+  const handleGetWhatsappSettings = (_req, res) => {
+    const db = store.getState();
+    if (!db.whatsapp_gateway_config) {
+      db.whatsapp_gateway_config = buildDefaultWhatsappGatewayConfig();
+      store.persist();
+    }
+    const runtime = getWaConfig();
+    res.json({
+      config: db.whatsapp_gateway_config,
+      gateway_terkonfigurasi: runtime.aktif && Boolean(runtime.url),
+      webhook_url: runtime.url || null,
+      app_url: runtime.appUrl
+    });
+  };
+  const handleUpdateWhatsappSettings = (req, res) => {
+    const db = store.getState();
+    const body = req.body ?? {};
+    let webhookUrl;
+    let appUrl;
+    try {
+      webhookUrl = normalizeGatewayUrl(body.webhook_url, "Webhook URL");
+      appUrl = normalizeGatewayUrl(body.app_url, "APP URL");
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "URL tidak valid." });
+      return;
+    }
+    const user = getCurrentUser(req);
+    const sekarang = (/* @__PURE__ */ new Date()).toISOString();
+    const config = {
+      id: 1,
+      webhook_url: webhookUrl,
+      webhook_token: String(body.webhook_token ?? "").trim(),
+      app_url: appUrl || `http://localhost:${PORT}`,
+      aktif: body.aktif !== false,
+      updated_at: sekarang,
+      updated_by: user?.id ?? null
+    };
+    db.whatsapp_gateway_config = config;
+    auditRequest(
+      req,
+      "whatsapp_gateway_update",
+      "settings",
+      1,
+      `Gateway WhatsApp diubah menjadi ${webhookUrl || "(kosong)"} (${config.aktif ? "aktif" : "nonaktif"}).`
+    );
+    store.persist();
+    broadcastEvent("settings_updated");
+    void deliverWaOutbox();
+    res.json({
+      config,
+      gateway_terkonfigurasi: config.aktif && Boolean(config.webhook_url),
+      webhook_url: config.webhook_url || null,
+      app_url: config.app_url
+    });
+  };
+  const handleTestWhatsappSettings = async (req, res) => {
+    const body = req.body ?? {};
+    const noWa = normalizeWaNumber(body.no_wa);
+    if (!noWa) {
+      res.status(400).json({ error: "Nomor WhatsApp tujuan wajib diisi." });
+      return;
+    }
+    const waConfig = getWaConfig();
+    if (!waConfig.aktif || !waConfig.url) {
+      res.status(400).json({ error: "Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan." });
+      return;
+    }
+    try {
+      const response = await fetch(waConfig.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...waConfig.token ? { Authorization: `Bearer ${waConfig.token}` } : {}
+        },
+        body: JSON.stringify({
+          event: "whatsapp_gateway_test",
+          to: noWa,
+          message: "Uji koneksi WhatsApp Gateway Reffo PrintFlow. Pesan ini hanya untuk pengujian.",
+          link: null,
+          dedupe_key: `whatsapp_gateway_test:${noWa}:${Date.now()}`
+        })
+      });
+      if (!response.ok) throw new Error(`Gateway menjawab HTTP ${response.status}`);
+      auditRequest(req, "whatsapp_gateway_test", "settings", 1, `Uji gateway ke ${noWa} berhasil.`);
+      res.json({ ok: true, to: noWa });
+    } catch (err) {
+      auditRequest(
+        req,
+        "whatsapp_gateway_test",
+        "settings",
+        1,
+        `Uji gateway ke ${noWa} gagal: ${err instanceof Error ? err.message : String(err)}`
+      );
+      res.status(502).json({ error: err instanceof Error ? err.message : "Gagal menguji gateway." });
+    }
+  };
+  app.get("/api/owner/settings/whatsapp", requireAuth(["owner"]), handleGetWhatsappSettings);
+  app.put("/api/owner/settings/whatsapp", requireAuth(["owner"]), handleUpdateWhatsappSettings);
+  app.post("/api/owner/settings/whatsapp/test", requireAuth(["owner"]), handleTestWhatsappSettings);
+  app.get("/api/admin/settings/whatsapp", requireAuth(["admin", "owner"]), handleGetWhatsappSettings);
+  app.put("/api/admin/settings/whatsapp", requireAuth(["admin", "owner"]), handleUpdateWhatsappSettings);
+  app.post("/api/admin/settings/whatsapp/test", requireAuth(["admin", "owner"]), handleTestWhatsappSettings);
   app.get("/api/owner/kpi/insentif", requireAuth(["owner"]), (req, res) => {
     const db = store.getState();
     res.json(
@@ -6624,7 +9011,7 @@ ${text}`,
         return;
       }
       kunci.add(key);
-      validated.push({ role, jenis, nominal: round2(nominal) });
+      validated.push({ role, jenis, nominal: round22(nominal) });
     }
     if (!Array.isArray(db.insentif_rates)) db.insentif_rates = [];
     for (const entry of validated) {
@@ -6674,9 +9061,72 @@ ${text}`,
     const message = err instanceof Error ? err.message : "Terjadi kesalahan pada server.";
     res.status(500).json({ error: message });
   });
+  let lastScheduledMaintenanceDate = "";
+  const runScheduledMaintenance = () => {
+    const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    if (lastScheduledMaintenanceDate === today) return;
+    lastScheduledMaintenanceDate = today;
+    try {
+      const db = store.getState();
+      const batas = Date.now() + 7 * 864e5;
+      let dibuatPiutang = 0;
+      for (const raw of db.orders.filter(activeOrderRaw)) {
+        const order = store.hydrateOrder(raw);
+        if (!(order.sisa_tagihan > 0)) continue;
+        const due = order.jatuh_tempo ? new Date(order.jatuh_tempo).getTime() : new Date(new Date(order.created_at).getTime() + 30 * 864e5).getTime();
+        if (due > batas) continue;
+        if (enqueueWa(
+          "piutang_jatuh_tempo",
+          `piutang_jatuh_tempo:${order.id}:${today}`,
+          order.customer?.no_wa ?? "",
+          `Pengingat: Nota ${order.no_nota} memiliki sisa tagihan Rp ${order.sisa_tagihan.toLocaleString("id-ID")} dengan jatuh tempo ${order.jatuh_tempo ? order.jatuh_tempo.slice(0, 10) : "-"}.`,
+          order.id,
+          `${appBaseUrl()}/?nota=${order.no_nota}`
+        )) {
+          dibuatPiutang += 1;
+        }
+      }
+      const { items } = hitungPajakReklame(db, PAJAK_REKLAME_HARI, /* @__PURE__ */ new Date());
+      let dibuatReklame = 0;
+      for (const row of items) {
+        if (!normalizeWaNumber(row.no_wa)) continue;
+        if (enqueueWa(
+          "pajak_reklame_jatuh_tempo",
+          `pajak_reklame_jatuh_tempo:${row.instansi_id}:${row.tahun}`,
+          row.no_wa,
+          `Pengingat pajak reklame: ${row.nama_instansi} memiliki masa berlaku hingga ${row.jatuh_tempo_berikutnya} (${row.hari_tersisa} hari lagi). Mohon segera perpanjang dan unggah bukti pembayaran.`,
+          null,
+          null
+        )) {
+          dibuatReklame += 1;
+        }
+      }
+      const tiff = hapusTiffLama(AUTO_CLEAN_TIFF_HARI, null, false);
+      const dihapus = tiff.filter((h) => h.dihapus).length;
+      recordAudit(
+        null,
+        "scheduled_maintenance",
+        "system",
+        0,
+        `Scheduler harian ${today}: pengingat piutang ${dibuatPiutang}, reklame ${dibuatReklame}, TIFF dihapus ${dihapus}.`
+      );
+      store.persist();
+      console.log(
+        `[scheduler] maintenance ${today}: piutang=${dibuatPiutang}, reklame=${dibuatReklame}, tiff=${dihapus}`
+      );
+    } catch (err) {
+      console.error("[scheduler] maintenance gagal:", err instanceof Error ? err.message : err);
+    }
+  };
+  if (process.env.NODE_ENV !== "test") {
+    runScheduledMaintenance();
+    const maintenanceTimer = setInterval(runScheduledMaintenance, 60 * 60 * 1e3);
+    maintenanceTimer.unref();
+  }
   return app;
 }
 async function start() {
+  assertSecurityEnv();
   await store.init();
   const app = buildApp();
   const isProd = process.env.NODE_ENV === "production";
@@ -6688,10 +9138,10 @@ async function start() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path3.resolve(process.cwd(), "dist");
+    const distDir = path4.resolve(process.cwd(), "dist");
     app.use(express.static(distDir));
     app.get("*", (_req, res) => {
-      res.sendFile(path3.join(distDir, "index.html"));
+      res.sendFile(path4.join(distDir, "index.html"));
     });
   }
   app.listen(PORT, "0.0.0.0", () => {
@@ -6701,4 +9151,7 @@ async function start() {
     worker.unref();
   });
 }
-start();
+start().catch((err) => {
+  console.error("[startup] Server gagal berjalan:", err instanceof Error ? err.message : err);
+  process.exit(1);
+});

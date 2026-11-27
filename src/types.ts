@@ -24,11 +24,15 @@ export type ProductionStatus =
   | 'menunggu_acc'
   | 'revisi'
   | 'antrean_cetak'
+  | 'siap_tata'
   | 'proses_cetak'
+  | 'gagal_cetak'
+  | 'cetak_ulang'
   | 'antrean_finishing'
   | 'proses_finishing'
   | 'siap_diambil'
-  | 'selesai';
+  | 'selesai'
+  | 'dibatalkan';
 
 export type SpkFieldStatus = 'antrean' | 'perakitan' | 'pemasangan' | 'selesai';
 
@@ -227,6 +231,29 @@ export interface InsentifRate {
   updated_by: number | null;
 }
 
+export interface WhatsAppGatewayConfig {
+  id: number;
+  webhook_url: string;
+  webhook_token: string;
+  app_url: string;
+  aktif: boolean;
+  updated_at: string | null;
+  updated_by: number | null;
+}
+
+export type TaxPriceMode = 'belum_termasuk_ppn' | 'sudah_termasuk_ppn';
+
+export interface TaxSettings {
+  id: number;
+  ppn_persen_default: number;
+  pph23_persen_default: number;
+  mode_harga: TaxPriceMode;
+  ppn_termasuk_diskon: boolean;
+  potong_pph23_otomatis: boolean;
+  updated_at: string | null;
+  updated_by: number | null;
+}
+
 export interface WhatsappOutbox {
   id: number;
   event: WhatsAppEvent;
@@ -235,6 +262,7 @@ export interface WhatsappOutbox {
   no_wa: string;
   pesan: string;
   link: string | null;
+  media_path?: string | null;
   status: 'pending' | 'terkirim' | 'gagal';
   attempts: number;
   last_error: string | null;
@@ -289,6 +317,83 @@ export interface MaterialOffcut {
   luas_m2: number;
   status: 'tersedia' | 'terpakai';
   created_at: string;
+}
+
+export interface StokCattoff {
+  id: number;
+  kode: string;
+  jenis_bahan: string;
+  lebar_m: number;
+  panjang_awal_m: number;
+  panjang_sisa_m: number;
+  status: 'aktif' | 'habis';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TintaWarna {
+  id: number;
+  kode: string;
+  warna: string;
+  satuan: string;
+  stok_ml: number;
+  stok_minimum_ml: number;
+  kapasitas_galon_ml: number;
+  roll_per_galon: number;
+  luas_per_roll_m2: number;
+  konsumsi_ml_per_m2: number;
+  aktif: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PemakaianTinta {
+  id: number;
+  order_item_id: number;
+  grup_id: number | null;
+  tinta_warna_id: number;
+  warna: string;
+  jumlah_ml: number;
+  luas_cetak_m2: number;
+  created_at: string;
+}
+
+export interface CetakGrupItem {
+  id: number;
+  grup_id: number;
+  order_item_id: number;
+  no_nota?: string;
+  nama_item?: string | null;
+  product_name?: string;
+  qty_order?: number;
+  qty_cetak: number;
+  panjang_file_m: number | null;
+  lebar_file_m: number | null;
+  sumber_bahan: 'roll' | 'cattoff' | 'offcut';
+  roll_id: number | null;
+  cattoff_id: number | null;
+  offcut_id: number | null;
+  offcut_lebar_m: number | null;
+  offcut_panjang_m: number | null;
+  masuk_wos_m2: number;
+  status: 'menunggu' | 'selesai' | 'kendala';
+  catatan: string | null;
+  updated_at: string;
+}
+
+export interface CetakGrup {
+  id: number;
+  kode_grup: string;
+  operator_id: number;
+  operator_name?: string | null;
+  machine_id: number;
+  machine_name?: string | null;
+  status: 'menunggu' | 'dalam_proses' | 'selesai' | 'batal';
+  tanggal: string;
+  catatan: string | null;
+  items?: CetakGrupItem[];
+  created_at: string;
+  updated_at: string;
 }
 
 export interface DesignRevision {
@@ -360,6 +465,8 @@ export interface OrderItem {
   finishing_user_name?: string | null;
   waktu_mulai_cetak?: string | null;
   waktu_selesai_cetak?: string | null;
+  ditata_at?: string | null;
+  qty_tercetak?: number;
   klik_total?: number | null;
   estimasi_tinta_ml?: number | null;
   batch_id?: number | null;
@@ -369,9 +476,18 @@ export interface OrderItem {
   acc_admin_id: number | null;
   acc_admin_name?: string | null;
   waktu_acc: string | null;
+  acc_pelanggan_at?: string | null;
+  acc_pelanggan_nama?: string | null;
+  acc_pelanggan_id?: number | null;
   file_preview_acc: string | null;
   file_cetak_tiff: string | null;
   file_master_arsip: string | null;
+  preflight_dpi_ok?: boolean | null;
+  preflight_cmyk_ok?: boolean | null;
+  preflight_bleed_ok?: boolean | null;
+  preflight_catatan?: string | null;
+  foto_finishing?: string | null;
+  foto_cetak_ulang?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -404,6 +520,7 @@ export interface Order {
   total_tagihan: number;
   jumlah_dp: number;
   sisa_tagihan: number;
+  biaya_desain?: number;
   status_bayar: PaymentStatus;
   status_nota?: 'aktif' | 'batal';
   alasan_batal?: string | null;
@@ -430,6 +547,8 @@ export interface Order {
   tanda_tangan_pengambil: string | null;
   nama_pengambil: string | null;
   no_wa_pengambil: string | null;
+  kurir_nama: string | null;
+  resi_pengiriman: string | null;
   waktu_serah_terima: string | null;
   catatan_pengecualian: string | null;
   deadline: string | null;
@@ -505,8 +624,11 @@ export interface BootstrapPayload {
   customers: Customer[];
   rolls: MaterialRoll[];
   offcuts: MaterialOffcut[];
+  cattoffs?: StokCattoff[];
+  tinta_warna?: TintaWarna[];
   machines: PrintMachine[];
   supplies: SupplyItem[];
   demo_switch_enabled?: boolean;
   shifts?: Shift[];
+  tax_settings?: TaxSettings;
 }

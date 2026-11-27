@@ -797,6 +797,9 @@ export const OrderSummaryModal: React.FC<OrderSummaryModalProps> = ({
                   <p>
                     Pengambil: {order.nama_pengambil} ({order.no_wa_pengambil})
                   </p>
+                  {(order.kurir_nama || order.resi_pengiriman) && (
+                    <p>Kurir/Resi: {order.kurir_nama ?? '-'}{order.resi_pengiriman ? ` / ${order.resi_pengiriman}` : ''}</p>
+                  )}
                   <p>Waktu: {formatTanggal(order.waktu_serah_terima)}</p>
                 </div>
               )}

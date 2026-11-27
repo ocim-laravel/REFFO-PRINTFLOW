@@ -1,10 +1,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { hashPassword } from './auth.ts';
-import { mysqlAdapter } from './mysql-adapter.ts';
+import crypto from 'node:crypto';
+import { hashPassword, verifyPassword } from './auth.ts';
+import { mysqlAdapter, type SyncTable } from './mysql-adapter.ts';
+import {
+  buildDefaultTaxSettings,
+  DEFAULT_ROLL_AREA_M2,
+  DEFAULT_ROLL_PER_GALON,
+  DEFAULT_TINTA_GALON_ML,
+  hitungTintaMlPerM2,
+} from './domain.ts';
 import type {
   AdvertisingSpk,
   AuditLog,
+  CetakGrup,
+  CetakGrupItem,
   Customer,
   CustomerCategory,
   DesignRevision,
@@ -22,6 +32,7 @@ import type {
   Order,
   OrderItem,
   OrderPayment,
+  PemakaianTinta,
   PrintBatch,
   PrintMachine,
   Product,
@@ -30,11 +41,15 @@ import type {
   PurchaseOrderItem,
   Shift,
   SpkFieldStatus,
+  StokCattoff,
   Supplier,
   SupplierPayment,
   SupplyItem,
   SupplyUsage,
+  TaxSettings,
+  TintaWarna,
   User,
+  WhatsAppGatewayConfig,
   WhatsappOutbox,
 } from '../src/types.ts';
 
@@ -50,6 +65,11 @@ export interface DatabaseState {
   finishings: Finishing[];
   material_rolls: MaterialRoll[];
   material_offcuts: MaterialOffcut[];
+  stok_cattoff: StokCattoff[];
+  tinta_warna: TintaWarna[];
+  pemakaian_tinta: PemakaianTinta[];
+  cetak_grup: Omit<CetakGrup, 'operator_name' | 'machine_name' | 'items'>[];
+  cetak_grup_item: Omit<CetakGrupItem, 'no_nota' | 'nama_item' | 'product_name' | 'qty_order'>[];
   machines: PrintMachine[];
   supplies: SupplyItem[];
   supply_usages: SupplyUsage[];
@@ -81,6 +101,8 @@ export interface DatabaseState {
   goods_receipts: GoodsReceipt[];
   supplier_payments: SupplierPayment[];
   whatsapp_outbox: WhatsappOutbox[];
+  whatsapp_gateway_config: WhatsAppGatewayConfig | null;
+  tax_settings: TaxSettings | null;
   audit_logs: AuditLog[];
   insentif_rates: InsentifRate[];
   counters: Record<string, number>;
@@ -121,6 +143,50 @@ export function buildDefaultInsentifRates(): InsentifRate[] {
     updated_at: null,
     updated_by: null,
   }));
+}
+
+export function buildDefaultTintaWarna(): TintaWarna[] {
+  const now = new Date().toISOString();
+  const konsumsi = hitungTintaMlPerM2(DEFAULT_TINTA_GALON_ML, DEFAULT_ROLL_PER_GALON, DEFAULT_ROLL_AREA_M2);
+  return [
+    { id: 1, kode: 'TINTA-C', warna: 'Cyan', satuan: 'ml', stok_ml: 5000, stok_minimum_ml: 1000, kapasitas_galon_ml: 5000, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now },
+    { id: 2, kode: 'TINTA-M', warna: 'Magenta', satuan: 'ml', stok_ml: 5000, stok_minimum_ml: 1000, kapasitas_galon_ml: 5000, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now },
+    { id: 3, kode: 'TINTA-Y', warna: 'Yellow', satuan: 'ml', stok_ml: 5000, stok_minimum_ml: 1000, kapasitas_galon_ml: 5000, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now },
+    { id: 4, kode: 'TINTA-K', warna: 'Black', satuan: 'ml', stok_ml: 5000, stok_minimum_ml: 1000, kapasitas_galon_ml: 5000, roll_per_galon: 6, luas_per_roll_m2: 224, konsumsi_ml_per_m2: konsumsi, aktif: true, created_at: now, updated_at: now },
+  ];
+}
+
+export function buildDefaultStokCattoff(): StokCattoff[] {
+  const now = new Date().toISOString();
+  return [
+    {
+      id: 1,
+      kode: 'CT-MMT280-01',
+      jenis_bahan: 'MMT 280',
+      lebar_m: 3.2,
+      panjang_awal_m: 15,
+      panjang_sisa_m: 15,
+      status: 'aktif',
+      created_at: now,
+      updated_at: now,
+    },
+  ];
+}
+
+/** Konfigurasi awal gateway WA: DB mengikuti .env saat pertama kali dibuat. */
+export function buildDefaultWhatsappGatewayConfig(): WhatsAppGatewayConfig {
+  const webhookUrl = String(process.env.WHATSAPP_WEBHOOK_URL ?? '').trim();
+  return {
+    id: 1,
+    webhook_url: webhookUrl.replace(/\/+$/, ''),
+    webhook_token: String(process.env.WHATSAPP_WEBHOOK_TOKEN ?? '').trim(),
+    app_url: String(process.env.APP_URL ?? `http://localhost:${process.env.PORT ?? 3000}`)
+      .trim()
+      .replace(/\/+$/, ''),
+    aktif: Boolean(webhookUrl),
+    updated_at: null,
+    updated_by: null,
+  };
 }
 
 export function priceForCategory(product: Product, category: CustomerCategory): number {
@@ -177,16 +243,74 @@ function notaDateStr(daysOffset = 0): string {
   return `${y}${m}${day}`;
 }
 
-function createInitialSeed(): DatabaseState {
-  const defaultPwd = hashPassword('password123');
-  const users: StoredUser[] = [
-    { id: 1, name: 'Rina', email: 'admin@reffoprint.id', role: 'admin', password: defaultPwd },
-    { id: 2, name: 'Budi', email: 'desainer@reffoprint.id', role: 'desainer', password: defaultPwd },
-    { id: 3, name: 'Agus', email: 'operator@reffoprint.id', role: 'operator_cetak', password: defaultPwd },
-    { id: 4, name: 'Dedi', email: 'finishing@reffoprint.id', role: 'finishing', password: defaultPwd },
-    { id: 5, name: 'Eko', email: 'advertising@reffoprint.id', role: 'advertising', password: defaultPwd },
-    { id: 6, name: 'Pak Hendra', email: 'owner@reffoprint.id', role: 'owner', password: defaultPwd },
-  ];
+function generateSeedPassword(): string {
+  return crypto.randomBytes(12).toString('base64url');
+}
+
+let seedCredentialsWritten = false;
+
+/**
+ * Password seed tidak boleh lagi "password123". Saat database baru dibuat,
+ * password acak ditulis sekali ke file lokal yang tidak ikut git agar admin
+ * bisa login pertama kali lalu menggantinya lewat menu staf.
+ */
+function writeSeedCredentials(rows: Array<{ email: string; role: string; password: string }>): void {
+  if (seedCredentialsWritten || rows.length === 0) return;
+  seedCredentialsWritten = true;
+  const file = path.join(DATA_DIR, 'initial-credentials.txt');
+  const body = [
+    '# Kredensial awal Reffo PrintFlow (HAPUS setelah semua password diganti)',
+    `# Dibuat: ${new Date().toISOString()}`,
+    ...rows.map((r) => `${r.role}\t${r.email}\t${r.password}`),
+    '',
+  ].join('\n');
+  fs.writeFileSync(file, body, { encoding: 'utf-8', mode: 0o600 });
+  console.warn(`[security] Password seed acak ditulis ke ${file}. Ganti password lalu hapus file ini.`);
+}
+
+function writePasswordResetReport(rows: Array<{ email: string; password: string }>): void {
+  if (rows.length === 0) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const file = path.join(DATA_DIR, `credentials-reset-${stamp}.txt`);
+  const body = [
+    '# Password default lama terdeteksi dan sudah direset otomatis.',
+    '# Simpan file ini sementara, login, ganti password, lalu hapus file.',
+    ...rows.map((r) => `${r.email}\t${r.password}`),
+    '',
+  ].join('\n');
+  fs.writeFileSync(file, body, { encoding: 'utf-8', mode: 0o600 });
+  console.warn(`[security] ${rows.length} akun memakai password default. Password baru ditulis ke ${file}.`);
+}
+
+function backupDatabaseFile(reason: string): string | null {
+  if (!fs.existsSync(DB_FILE)) return null;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupDir = path.join(DATA_DIR, 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const target = path.join(backupDir, `db-${reason}-${stamp}.json`);
+  fs.copyFileSync(DB_FILE, target);
+  console.warn(`[backup] db.json disalin ke ${target}`);
+  return target;
+}
+
+function createInitialSeed(writeCredentials = true): DatabaseState {
+  const credentials = [
+    { id: 1, name: 'Rina', email: 'admin@reffoprint.id', role: 'admin' as const },
+    { id: 2, name: 'Budi', email: 'desainer@reffoprint.id', role: 'desainer' as const },
+    { id: 3, name: 'Agus', email: 'operator@reffoprint.id', role: 'operator_cetak' as const },
+    { id: 4, name: 'Dedi', email: 'finishing@reffoprint.id', role: 'finishing' as const },
+    { id: 5, name: 'Eko', email: 'advertising@reffoprint.id', role: 'advertising' as const },
+    { id: 6, name: 'Pak Hendra', email: 'owner@reffoprint.id', role: 'owner' as const },
+  ].map((row) => ({ ...row, password: generateSeedPassword() }));
+  if (writeCredentials) writeSeedCredentials(credentials);
+  const users: StoredUser[] = credentials.map((row) => ({
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    password: hashPassword(row.password),
+    active: true,
+  }));
 
   const instansis: Instansi[] = [
     { id: 1, nama_instansi: 'Perorangan' },
@@ -626,6 +750,8 @@ function createInitialSeed(): DatabaseState {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(1, 17),
@@ -655,6 +781,8 @@ function createInitialSeed(): DatabaseState {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(1, 12),
@@ -684,6 +812,8 @@ function createInitialSeed(): DatabaseState {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(2, 16),
@@ -713,6 +843,8 @@ function createInitialSeed(): DatabaseState {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(0, 17),
@@ -742,6 +874,8 @@ function createInitialSeed(): DatabaseState {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
       deadline: isoOffsetDays(2, 15),
@@ -771,6 +905,8 @@ function createInitialSeed(): DatabaseState {
       tanda_tangan_pengambil: null,
       nama_pengambil: 'Bagus (Kurir PT Graha)',
       no_wa_pengambil: '081345670000',
+      kurir_nama: 'Kurir PT Graha',
+      resi_pengiriman: null,
       waktu_serah_terima: isoOffsetDays(-3, 16),
       catatan_pengecualian: null,
       deadline: isoOffsetDays(-3, 17),
@@ -1270,6 +1406,11 @@ function createInitialSeed(): DatabaseState {
     finishings,
     material_rolls,
     material_offcuts,
+    stok_cattoff: buildDefaultStokCattoff(),
+    tinta_warna: buildDefaultTintaWarna(),
+    pemakaian_tinta: [],
+    cetak_grup: [],
+    cetak_grup_item: [],
     machines,
     supplies,
     supply_usages: [],
@@ -1287,15 +1428,23 @@ function createInitialSeed(): DatabaseState {
     goods_receipts: [],
     supplier_payments: [],
     whatsapp_outbox: [],
+    whatsapp_gateway_config: buildDefaultWhatsappGatewayConfig(),
+    tax_settings: buildDefaultTaxSettings(),
     audit_logs: [],
     insentif_rates: buildDefaultInsentifRates(),
     counters: {
+      users: 6,
       instansis: 5,
       customers: 5,
       products: 13,
       finishings: 7,
       material_rolls: 7,
       material_offcuts: 2,
+      stok_cattoff: 1,
+      tinta_warna: 4,
+      pemakaian_tinta: 0,
+      cetak_grup: 0,
+      cetak_grup_item: 0,
       machines: 4,
       supplies: 7,
       supply_usages: 0,
@@ -1321,6 +1470,7 @@ function createInitialSeed(): DatabaseState {
 
 class Store {
   private state: DatabaseState;
+  private criticalDepth = 0;
 
   constructor() {
     if (!fs.existsSync(DATA_DIR)) {
@@ -1331,7 +1481,19 @@ class Store {
         const raw = fs.readFileSync(DB_FILE, 'utf-8');
         this.state = JSON.parse(raw) as DatabaseState;
         this.migrateInMemory();
-      } catch {
+      } catch (err) {
+        // Jangan langsung menimpa database yang rusak. Simpan bukti dulu.
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const corruptFile = `${DB_FILE}.corrupt-${stamp}`;
+        try {
+          fs.copyFileSync(DB_FILE, corruptFile);
+        } catch (copyErr) {
+          console.error('[backup] Gagal menyalin db.json rusak:', copyErr);
+        }
+        console.error(
+          `[store] db.json tidak dapat dibaca (${(err as Error).message}). ` +
+            `File asli disimpan sebagai ${corruptFile}. Data seed baru dibuat.`,
+        );
         this.state = createInitialSeed();
         this.persist();
       }
@@ -1357,6 +1519,64 @@ class Store {
       this.state.audit_logs = [];
       this.state.counters.audit_logs = 0;
       changed = true;
+    }
+
+    const waDefault = buildDefaultWhatsappGatewayConfig();
+    const waConfig = this.state.whatsapp_gateway_config;
+    if (!waConfig || typeof waConfig !== 'object') {
+      this.state.whatsapp_gateway_config = waDefault;
+      changed = true;
+    } else {
+      if (!Number.isFinite(Number(waConfig.id))) {
+        waConfig.id = 1;
+        changed = true;
+      }
+      if (waConfig.webhook_url === undefined || waConfig.webhook_url === null) {
+        waConfig.webhook_url = waDefault.webhook_url;
+        changed = true;
+      }
+      if (waConfig.webhook_token === undefined || waConfig.webhook_token === null) {
+        waConfig.webhook_token = waDefault.webhook_token;
+        changed = true;
+      }
+      if (waConfig.app_url === undefined || waConfig.app_url === null) {
+        waConfig.app_url = waDefault.app_url;
+        changed = true;
+      }
+      if (waConfig.aktif === undefined || waConfig.aktif === null) {
+        waConfig.aktif = waDefault.aktif;
+        changed = true;
+      }
+      if (waConfig.updated_at === undefined) {
+        waConfig.updated_at = null;
+        changed = true;
+      }
+      if (waConfig.updated_by === undefined) {
+        waConfig.updated_by = null;
+        changed = true;
+      }
+    }
+
+    if (!this.state.tax_settings) {
+      this.state.tax_settings = buildDefaultTaxSettings();
+      changed = true;
+    }
+    if (!Array.isArray(this.state.stok_cattoff) || this.state.stok_cattoff.length === 0) {
+      this.state.stok_cattoff = buildDefaultStokCattoff();
+      this.state.counters.stok_cattoff = this.state.stok_cattoff.length;
+      changed = true;
+    }
+    if (!Array.isArray(this.state.tinta_warna) || this.state.tinta_warna.length === 0) {
+      this.state.tinta_warna = buildDefaultTintaWarna();
+      this.state.counters.tinta_warna = this.state.tinta_warna.length;
+      changed = true;
+    }
+    for (const key of ['pemakaian_tinta', 'cetak_grup', 'cetak_grup_item'] as const) {
+      if (!Array.isArray(this.state[key])) {
+        (this.state as unknown as Record<string, unknown>)[key] = [];
+        this.state.counters[key] = 0;
+        changed = true;
+      }
     }
 
     const defaultRates = buildDefaultInsentifRates();
@@ -1398,7 +1618,7 @@ class Store {
       this.state.supplies.length === 0 ||
       !Array.isArray(this.state.suppliers) ||
       this.state.suppliers.length === 0;
-    const seed = needsMasterSeed ? createInitialSeed() : null;
+    const seed = needsMasterSeed ? createInitialSeed(false) : null;
     if (seed) {
       if (!Array.isArray(this.state.machines) || this.state.machines.length === 0) {
         this.state.machines = seed.machines;
@@ -1440,16 +1660,37 @@ class Store {
       }
     }
 
+    const resetPasswords: Array<{ email: string; password: string }> = [];
     for (const u of this.state.users) {
       if (!u.password.startsWith('scrypt:')) {
-        u.password = hashPassword(u.password);
+        if (u.password === 'password123') {
+          const replacement = generateSeedPassword();
+          resetPasswords.push({ email: u.email, password: replacement });
+          u.password = hashPassword(replacement);
+        } else {
+          u.password = hashPassword(u.password);
+        }
         changed = true;
+      } else {
+        let isDefault = false;
+        try {
+          isDefault = verifyPassword('password123', u.password);
+        } catch {
+          isDefault = false;
+        }
+        if (isDefault) {
+          const replacement = generateSeedPassword();
+          resetPasswords.push({ email: u.email, password: replacement });
+          u.password = hashPassword(replacement);
+          changed = true;
+        }
       }
       if (typeof u.active !== 'boolean') {
         u.active = true;
         changed = true;
       }
     }
+    writePasswordResetReport(resetPasswords);
     for (const inst of this.state.instansis) {
       if (inst.npwp === undefined) {
         inst.npwp = null;
@@ -1507,6 +1748,18 @@ class Store {
         order.tanda_tangan_pengambil = null;
         changed = true;
       }
+      if (order.kurir_nama === undefined) {
+        order.kurir_nama = null;
+        changed = true;
+      }
+      if (order.resi_pengiriman === undefined) {
+        order.resi_pengiriman = null;
+        changed = true;
+      }
+      if (order.biaya_desain === undefined) {
+        order.biaya_desain = 0;
+        changed = true;
+      }
     }
     for (const item of this.state.order_items) {
       if (item.diskon_persen === undefined) {
@@ -1542,6 +1795,13 @@ class Store {
         item.ukuran_lembar = product?.ukuran_lembar ?? null;
         changed = true;
       }
+      if (item.preflight_dpi_ok === undefined) {
+        item.preflight_dpi_ok = null;
+        item.preflight_cmyk_ok = null;
+        item.preflight_bleed_ok = null;
+        item.preflight_catatan = null;
+        changed = true;
+      }
     }
     for (const payment of this.state.order_payments) {
       if (payment.shift_id === undefined) {
@@ -1549,9 +1809,17 @@ class Store {
         changed = true;
       }
     }
-    for (const key of ['suppliers', 'purchase_orders', 'goods_receipts', 'supplier_payments', 'whatsapp_outbox', 'insentif_rates'] as const) {
-      const rows = this.state[key] as Array<{ id: number }>;
-      this.state.counters[key] = Math.max(this.state.counters[key] ?? 0, ...rows.map((r) => r.id));
+    // Sinkronkan SEMUA counter dengan ID maksimum yang benar-benar ada.
+    // Dulu hanya sebagian tabel yang disinkronkan sehingga tabel seperti `users`
+    // bisa mulai dari 1 lagi dan menabrak ID akun yang sudah ada.
+    for (const [key, value] of Object.entries(this.state)) {
+      if (!Array.isArray(value)) continue;
+      const rows = value as Array<{ id?: number }>;
+      const maxId = rows.reduce(
+        (max, row) => Math.max(max, Number.isFinite(Number(row?.id)) ? Number(row?.id) : 0),
+        0,
+      );
+      this.state.counters[key] = Math.max(this.state.counters[key] ?? 0, maxId);
     }
     if (changed) {
       this.persist();
@@ -1560,8 +1828,7 @@ class Store {
 
   public async init(): Promise<void> {
     if (mysqlAdapter.isEnabled()) {
-      const seed = createInitialSeed();
-      this.state = await mysqlAdapter.initialize(seed);
+      this.state = await mysqlAdapter.initialize(() => createInitialSeed(true));
       this.migrateInMemory();
       console.log('Reffo PrintFlow terhubung ke MySQL localhost.');
     }
@@ -1580,6 +1847,9 @@ class Store {
 
   public persist(): void {
     if (mysqlAdapter.isEnabled()) {
+      // Operasi kritis menulis perubahan di dalam transaksi yang sama
+      // (lihat critical()), jadi jangan antre snapshot tambahan.
+      if (this.criticalDepth > 0) return;
       mysqlAdapter.queuePersist(this.state);
       return;
     }
@@ -1588,7 +1858,38 @@ class Store {
     fs.renameSync(tmpFile, DB_FILE);
   }
 
+  /**
+   * Jalankan mutasi stok/transaksi kritis dengan lock baris MySQL
+   * (SELECT ... FOR UPDATE) dan persist CRUD per entitas dalam satu transaksi.
+   * Bila gagal, state di memori dikembalikan ke snapshot sebelumnya.
+   */
+  public async critical<T>(
+    tables: SyncTable[],
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    if (!mysqlAdapter.isEnabled()) {
+      const snapshot = JSON.parse(JSON.stringify(this.state)) as DatabaseState;
+      try {
+        return await fn();
+      } catch (err) {
+        this.state = snapshot;
+        throw err;
+      }
+    }
+    const snapshot = JSON.parse(JSON.stringify(this.state)) as DatabaseState;
+    this.criticalDepth += 1;
+    try {
+      return await mysqlAdapter.runLocked(() => this.state, tables, fn);
+    } catch (err) {
+      this.state = snapshot;
+      throw err;
+    } finally {
+      this.criticalDepth -= 1;
+    }
+  }
+
   public resetSeed(): void {
+    backupDatabaseFile('pre-reset');
     this.state = createInitialSeed();
     this.persist();
   }

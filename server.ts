@@ -11,6 +11,7 @@ import {
   priceForCategory,
   computeUkuranKotor,
   STANDARD_ROLL_SPECS,
+  buildDefaultWhatsappGatewayConfig,
   INSENTIF_ROLES,
   INSENTIF_JENIS,
   type StoredUser,
@@ -22,6 +23,24 @@ import {
   verifySessionToken,
   parseCookie,
 } from './server/auth.ts';
+import { assertSecurityEnv } from './server/security.ts';
+import { safeUploadFilename, toPublicPreviewUrl } from './server/uploads.ts';
+import {
+  buildDefaultTaxSettings,
+  computeEffectiveTaxRates,
+  hitungPajakNota,
+  hitungPemakaianBahanPrn,
+  hitungPemakaianTintaPerWarna,
+  hitungTintaMlPerM2,
+  isEditableMasterFilename,
+  isTiffFilename,
+  parsePositiveId,
+  parseTanggalInput,
+  resolveBulkTiffMapping,
+  resolveQcStatus,
+  statusSetelahCetak,
+  type BulkTiffMapEntry,
+} from './server/domain.ts';
 import type {
   AuditLog,
   CustomerCategory,
@@ -45,9 +64,12 @@ import type {
   SupplierPayment,
   SupplyItem,
   SupplyUsage,
+  TaxPriceMode,
+  TaxSettings,
   User,
   UserRole,
   WhatsAppEvent,
+  WhatsAppGatewayConfig,
   WhatsappOutbox,
 } from './src/types.ts';
 
@@ -55,8 +77,6 @@ const PORT = Number(process.env.PORT ?? 3000);
 const SESSION_COOKIE = 'reffo_session';
 const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
 const MAX_UPLOAD_MB = Math.max(1, Number(process.env.MAX_UPLOAD_MB ?? 20));
-const WHATSAPP_WEBHOOK_URL = String(process.env.WHATSAPP_WEBHOOK_URL ?? '').trim();
-const WHATSAPP_WEBHOOK_TOKEN = String(process.env.WHATSAPP_WEBHOOK_TOKEN ?? '').trim();
 const AUTO_CLEAN_TIFF_HARI = Math.max(1, Number(process.env.AUTO_CLEAN_TIFF_HARI ?? 90));
 const PAJAK_REKLAME_HARI = Math.min(365, Math.max(0, Number(process.env.PAJAK_REKLAME_HARI ?? 30)));
 if (!fs.existsSync(UPLOADS_DIR)) {
@@ -64,7 +84,7 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 
 function demoSwitchEnabled(): boolean {
-  return (process.env.ENABLE_DEMO_SWITCH ?? 'true').trim().toLowerCase() !== 'false';
+  return (process.env.ENABLE_DEMO_SWITCH ?? 'false').trim().toLowerCase() === 'true';
 }
 
 const ALLOWED_UPLOAD_EXTENSIONS = new Set([
@@ -72,19 +92,22 @@ const ALLOWED_UPLOAD_EXTENSIONS = new Set([
   '.tif', '.tiff', '.ai', '.psd', '.cdr', '.zip', '.rar',
 ]);
 
+const uploadStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+  filename: (_req, file, cb) => {
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+    cb(null, `${Date.now()}-${safeName}`);
+  },
+});
+
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-    filename: (_req, file, cb) => {
-      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-      cb(null, `${Date.now()}-${safeName}`);
-    },
-  }),
+  storage: uploadStorage,
   limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const mime = (file.mimetype ?? '').toLowerCase();
     const mimeOk =
+      mime === '' ||
       mime.startsWith('image/') ||
       [
         'application/pdf',
@@ -97,6 +120,7 @@ const upload = multer({
         'application/vnd.rar',
         'application/octet-stream',
         'application/x-coreldraw',
+        'application/vnd.corel-draw',
       ].includes(mime);
     if (!ALLOWED_UPLOAD_EXTENSIONS.has(ext) || !mimeOk) {
       cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
@@ -105,6 +129,45 @@ const upload = multer({
     cb(null, true);
   },
 });
+
+const uploadPhoto = multer({
+  storage: uploadStorage,
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const mime = (file.mimetype ?? '').toLowerCase();
+    if (!['.jpg', '.jpeg', '.png', '.webp'].includes(ext) || !mime.startsWith('image/')) {
+      cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+const uploadBulkTiff = multer({
+  storage: uploadStorage,
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 30 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (ext !== '.tif' && ext !== '.tiff') {
+      cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+function cleanupUploadedFiles(files: Array<{ path?: string }> | undefined): void {
+  for (const f of files ?? []) {
+    if (!f?.path) continue;
+    try {
+      if (fs.existsSync(f.path)) fs.unlinkSync(f.path);
+    } catch {
+      // abaikan gagal cleanup temp file
+    }
+  }
+}
+
 
 
 const sseClients = new Set<Response>();
@@ -136,16 +199,16 @@ function extractToken(req: Request): string | null {
     if (bearer) return bearer;
   }
   const cookieToken = parseCookie(req.header('cookie'), SESSION_COOKIE);
-  if (cookieToken) return cookieToken;
-  const queryToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
-  return queryToken || null;
+  return cookieToken || null;
 }
 
 function getActiveUser(req: Request): StoredUser | null {
   const token = extractToken(req);
   const payload = verifySessionToken(token);
   if (!payload) return null;
-  return store.getState().users.find((u) => u.id === payload.uid) ?? null;
+  const user = store.getState().users.find((u) => u.id === payload.uid) ?? null;
+  if (!user || user.active === false) return null;
+  return user;
 }
 
 function setSessionCookie(res: Response, token: string) {
@@ -183,6 +246,47 @@ function clientIp(req: Request): string | null {
   const forwarded = req.header('x-forwarded-for');
   if (forwarded) return forwarded.split(',')[0]?.trim() ?? null;
   return req.socket?.remoteAddress ?? null;
+}
+
+/**
+ * Tahan respons sampai transaksi MySQL commit. Bila persist gagal, klien
+ * menerima 500 dan state memori sudah dikembalikan oleh store.critical().
+ */
+async function runTransactional(
+  res: Response,
+  work: () => Promise<unknown>,
+  errorMessage: string,
+): Promise<void> {
+  const capture: { value: { status: number; body: unknown } | null } = { value: null };
+  const originalStatus = res.status.bind(res);
+  const originalJson = res.json.bind(res);
+
+  res.status = ((code: number) => {
+    capture.value = { status: code, body: capture.value?.body };
+    return res;
+  }) as Response['status'];
+  res.json = ((body: unknown) => {
+    capture.value = { status: capture.value?.status ?? 200, body };
+    return res;
+  }) as Response['json'];
+
+  try {
+    await work();
+  } catch (err) {
+    console.error('[transaction]', err);
+    res.status = originalStatus;
+    res.json = originalJson;
+    if (!res.headersSent) {
+      originalStatus(500).json({ error: errorMessage });
+    }
+    return;
+  }
+
+  res.status = originalStatus;
+  res.json = originalJson;
+  if (capture.value) {
+    originalStatus(capture.value.status).json(capture.value.body);
+  }
 }
 
 function recordAudit(
@@ -224,8 +328,48 @@ function auditRequest(
   return recordAudit(current, action, entity, entityId, detail, clientIp(req));
 }
 
+interface WaRuntimeConfig {
+  url: string;
+  token: string;
+  appUrl: string;
+  aktif: boolean;
+}
+
+/**
+ * Config gateway dibaca dari DB setiap kali dipakai, sehingga perubahan lewat
+ * halaman Setting → WhatsApp Gateway langsung berlaku tanpa restart server.
+ * Environment hanya dipakai sebagai fallback untuk data lama.
+ */
+function getWaConfig(): WaRuntimeConfig {
+  const config = store.getState().whatsapp_gateway_config;
+  const fallbackUrl = String(process.env.WHATSAPP_WEBHOOK_URL ?? '').trim();
+  const rawUrl = config?.webhook_url ?? fallbackUrl;
+  return {
+    url: String(rawUrl).trim().replace(/\/+$/, ''),
+    token: String(config?.webhook_token ?? process.env.WHATSAPP_WEBHOOK_TOKEN ?? '').trim(),
+    appUrl: String(config?.app_url ?? process.env.APP_URL ?? `http://localhost:${PORT}`)
+      .trim()
+      .replace(/\/+$/, ''),
+    aktif: config?.aktif ?? Boolean(rawUrl),
+  };
+}
+
 function appBaseUrl(): string {
-  return String(process.env.APP_URL ?? `http://localhost:${PORT}`).replace(/\/+$/, '');
+  return getWaConfig().appUrl;
+}
+
+function normalizeGatewayUrl(value: unknown, label: string): string {
+  const raw = String(value ?? '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('Protokol harus http atau https.');
+    }
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    throw new Error(`${label} harus berupa URL http/https yang valid.`);
+  }
 }
 
 function normalizeWaNumber(value: unknown): string {
@@ -244,11 +388,13 @@ function enqueueWa(
   pesan: string,
   orderId: number | null = null,
   link: string | null = null,
+  mediaPath: string | null = null,
 ): WhatsappOutbox | null {
   const db = store.getState();
   const nomor = normalizeWaNumber(noWa);
   if (!nomor || db.whatsapp_outbox.some((w) => w.dedupe_key === dedupeKey)) return null;
   const now = new Date().toISOString();
+  const waConfig = getWaConfig();
   const row: WhatsappOutbox = {
     id: store.nextId('whatsapp_outbox'),
     event,
@@ -257,9 +403,10 @@ function enqueueWa(
     no_wa: nomor,
     pesan,
     link,
+    media_path: mediaPath,
     status: 'pending',
     attempts: 0,
-    last_error: WHATSAPP_WEBHOOK_URL ? null : 'Gateway WhatsApp belum dikonfigurasi (WHATSAPP_WEBHOOK_URL).',
+    last_error: waConfig.aktif && waConfig.url ? null : 'Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan.',
     next_attempt_at: null,
     created_at: now,
     updated_at: now,
@@ -299,11 +446,12 @@ async function deliverWaOutbox(): Promise<void> {
         (!w.next_attempt_at || new Date(w.next_attempt_at).getTime() <= now),
     );
     if (pending.length === 0) return;
+    const waConfig = getWaConfig();
     let changed = false;
 
     for (const w of pending) {
-      if (!WHATSAPP_WEBHOOK_URL) {
-        const error = 'Gateway WhatsApp belum dikonfigurasi (WHATSAPP_WEBHOOK_URL).';
+      if (!waConfig.aktif || !waConfig.url) {
+        const error = 'Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan.';
         if (w.last_error !== error) {
           w.last_error = error;
           w.updated_at = new Date().toISOString();
@@ -312,17 +460,18 @@ async function deliverWaOutbox(): Promise<void> {
         continue;
       }
       try {
-        const response = await fetch(WHATSAPP_WEBHOOK_URL, {
+        const response = await fetch(waConfig.url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            ...(WHATSAPP_WEBHOOK_TOKEN ? { Authorization: `Bearer ${WHATSAPP_WEBHOOK_TOKEN}` } : {}),
+            ...(waConfig.token ? { Authorization: `Bearer ${waConfig.token}` } : {}),
           },
           body: JSON.stringify({
             event: w.event,
             to: w.no_wa,
             message: w.pesan,
             link: w.link,
+            media_path: w.media_path ?? null,
             dedupe_key: w.dedupe_key,
           }),
         });
@@ -426,6 +575,37 @@ function getOpenShiftFor(kasirId: number): Shift | null {
   return (
     db.shifts.find((s) => s.kasir_id === kasirId && s.status === 'buka') ?? null
   );
+}
+
+/**
+ * Karena admin kasir tunggal, setiap admin login langsung memiliki shift aktif.
+ * Jika belum ada shift terbuka milik admin tersebut, buka otomatis dengan kas awal 0.
+ */
+function ensureAdminOpenShift(user: StoredUser, ip: string | null): Shift | null {
+  if (user.role !== 'admin') return null;
+  const existing = getOpenShiftFor(user.id);
+  if (existing) return existing;
+  const now = new Date().toISOString();
+  const shift: Shift = {
+    id: store.nextId('shifts'),
+    kasir_id: user.id,
+    opened_at: now,
+    closed_at: null,
+    opening_cash: 0,
+    expected_tunai: 0,
+    expected_transfer: 0,
+    expected_qris: 0,
+    actual_tunai: 0,
+    actual_transfer: 0,
+    actual_qris: 0,
+    selisih: 0,
+    catatan: 'Dibuka otomatis saat login admin',
+    status: 'buka',
+  };
+  store.getState().shifts.push(shift);
+  recordAudit(user, 'shift_auto_open', 'shift', shift.id, 'Shift dibuka otomatis saat Admin login', ip);
+  broadcastEvent('shift_updated', { shiftId: shift.id });
+  return shift;
 }
 
 function computeShiftExpectation(shift: Shift): {
@@ -868,7 +1048,56 @@ function toCsv(headers: string[], rows: Array<Array<string | number | null | und
 function buildApp() {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
-  app.use('/uploads', express.static(UPLOADS_DIR));
+
+  app.param(['id', 'orderId', 'itemId'], (_req, res, next, val) => {
+    if (!parsePositiveId(val)) {
+      res.status(422).json({ error: 'Parameter ID harus berupa bilangan bulat positif.' });
+      return;
+    }
+    next();
+  });
+
+  // File Self-ACC hanya bisa diakses lewat token nota yang bersangkutan.
+  app.get('/api/public/approval/:token/file/:filename', (req, res) => {
+    const token = String(req.params.token ?? '').trim();
+    const name = safeUploadFilename(String(req.params.filename ?? ''));
+    const db = store.getState();
+    const order = db.orders.find((row) => row.approval_token && row.approval_token === token);
+    if (!order || !name) {
+      res.status(404).json({ error: 'File tidak ditemukan.' });
+      return;
+    }
+    const allowed = new Set<string>();
+    const add = (stored: string | null | undefined) => {
+      if (stored?.startsWith('/uploads/')) {
+        const base = safeUploadFilename(stored.slice('/uploads/'.length));
+        if (base) allowed.add(base);
+      }
+    };
+    add(order.lampiran_briefing);
+    for (const item of db.order_items.filter((row) => row.order_id === order.id)) {
+      add(item.file_preview_acc);
+    }
+    for (const revision of db.design_revisions.filter((row) => row.order_id === order.id)) {
+      add(revision.file_preview);
+    }
+    for (const payment of db.order_payments.filter((row) => row.order_id === order.id)) {
+      add(payment.bukti_bayar);
+    }
+    if (!allowed.has(name)) {
+      res.status(404).json({ error: 'File bukan milik nota ini.' });
+      return;
+    }
+    res.sendFile(path.join(UPLOADS_DIR, name), {
+      headers: { 'Cache-Control': 'private, max-age=300' },
+    });
+  });
+
+  app.use(
+    '/uploads',
+    requireAuth(),
+    express.static(UPLOADS_DIR, { index: false, dotfiles: 'deny', fallthrough: true }),
+  );
 
   // --- AUTH ---
   app.get('/api/auth/accounts', (_req, res) => {
@@ -895,9 +1124,10 @@ function buildApp() {
     }
     const token = signSessionToken(user.id, user.role);
     setSessionCookie(res, token);
+    const activeShift = ensureAdminOpenShift(user, clientIp(req));
     recordAudit(user, 'login', 'auth', user.id, `Login berhasil sebagai ${user.role}`, clientIp(req));
     store.persist();
-    res.json({ user: sanitizeUser(user), token });
+    res.json({ user: sanitizeUser(user), token, shift: activeShift ? hydrateShift(activeShift) : null });
   });
 
   app.post('/api/auth/switch', (req, res) => {
@@ -919,9 +1149,10 @@ function buildApp() {
     }
     const token = signSessionToken(user.id, user.role);
     setSessionCookie(res, token);
+    const activeShift = ensureAdminOpenShift(user, clientIp(req));
     recordAudit(user, 'login_switch', 'auth', user.id, 'Login via demo switch', clientIp(req));
     store.persist();
-    res.json({ user: sanitizeUser(user), token });
+    res.json({ user: sanitizeUser(user), token, shift: activeShift ? hydrateShift(activeShift) : null });
   });
 
   app.post('/api/auth/logout', (_req, res) => {
@@ -980,11 +1211,108 @@ function buildApp() {
       customers: db.customers,
       rolls: db.material_rolls,
       offcuts: db.material_offcuts,
+      cattoffs: db.stok_cattoff ?? [],
+      tinta_warna: db.tinta_warna ?? [],
       machines: db.machines ?? [],
       supplies: db.supplies ?? [],
       demo_switch_enabled: demoSwitchEnabled(),
       shifts,
+      tax_settings: db.tax_settings ?? buildDefaultTaxSettings(),
     });
+  });
+
+  app.get('/api/badges', requireAuth(), (req, res) => {
+    const user = getCurrentUser(req);
+    const db = store.getState();
+    const activeOrders = db.orders.filter(activeOrderRaw);
+    const activeOrderIds = new Set(activeOrders.map((o) => o.id));
+    const designStatuses = new Set<ProductionStatus>([
+      'menunggu_desain',
+      'proses_desain',
+      'menunggu_acc',
+      'revisi',
+    ]);
+    const printStatuses = new Set<ProductionStatus>([
+      'antrean_cetak',
+      'siap_tata',
+      'proses_cetak',
+      'gagal_cetak',
+      'cetak_ulang',
+    ]);
+
+    const adminReviews = activeOrders.filter((o) =>
+      db.order_items.some(
+        (i) => i.order_id === o.id && i.status_produksi === 'menunggu_acc' && !i.acc_admin_id,
+      ),
+    ).length;
+    const desainerQueue = activeOrders.filter((o) =>
+      db.order_items.some((i) => i.order_id === o.id && designStatuses.has(i.status_produksi)),
+    ).length;
+    const operatorQueue = db.order_items.filter(
+      (i) => activeOrderIds.has(i.order_id) && printStatuses.has(i.status_produksi),
+    ).length;
+    const finishingQueue = db.order_items.filter(
+      (i) =>
+        activeOrderIds.has(i.order_id) &&
+        (i.status_produksi === 'antrean_finishing' || i.status_produksi === 'proses_finishing'),
+    ).length;
+    const advertisingSpk = db.advertising_spks.filter((s) => s.status_lapangan !== 'selesai').length;
+    const serahTerima = activeOrders
+      .map((o) => store.hydrateOrder(o))
+      .filter((o) => store.isOrderSiapDiambil(o)).length;
+
+    res.json({
+      badges: {
+        admin_reviews: adminReviews,
+        desainer_queue: desainerQueue,
+        operator_queue: operatorQueue,
+        finishing_queue: finishingQueue,
+        advertising_spk: advertisingSpk,
+        serah_terima: serahTerima,
+      },
+      shift_aktif: user.role === 'admin' ? Boolean(getOpenShiftFor(user.id)) : false,
+    });
+  });
+
+  app.get('/api/settings/tax', requireAuth(), (_req, res) => {
+    const db = store.getState();
+    res.json({ tax_settings: db.tax_settings ?? buildDefaultTaxSettings() });
+  });
+
+  app.put('/api/owner/settings/tax', requireAuth(['owner']), (req, res) => {
+    const user = getCurrentUser(req);
+    const db = store.getState();
+    const body = (req.body ?? {}) as Partial<TaxSettings>;
+    const current = db.tax_settings ?? buildDefaultTaxSettings();
+    const mode: TaxPriceMode =
+      body.mode_harga === 'sudah_termasuk_ppn' ? 'sudah_termasuk_ppn' : 'belum_termasuk_ppn';
+    const next: TaxSettings = {
+      id: 1,
+      ppn_persen_default: clampPercent(body.ppn_persen_default ?? current.ppn_persen_default),
+      pph23_persen_default: clampPercent(body.pph23_persen_default ?? current.pph23_persen_default),
+      mode_harga: mode,
+      ppn_termasuk_diskon:
+        body.ppn_termasuk_diskon !== undefined
+          ? Boolean(body.ppn_termasuk_diskon)
+          : current.ppn_termasuk_diskon,
+      potong_pph23_otomatis:
+        body.potong_pph23_otomatis !== undefined
+          ? Boolean(body.potong_pph23_otomatis)
+          : current.potong_pph23_otomatis,
+      updated_at: new Date().toISOString(),
+      updated_by: user.id,
+    };
+    db.tax_settings = next;
+    auditRequest(
+      req,
+      'tax_settings_update',
+      'settings',
+      1,
+      `Pengaturan pajak diperbarui: PPN ${next.ppn_persen_default}%, PPh23 ${next.pph23_persen_default}%, mode ${next.mode_harga}.`,
+    );
+    store.persist();
+    broadcastEvent('settings_updated');
+    res.json({ tax_settings: next });
   });
 
   // --- AI WHATSAPP ORDER PARSER ---
@@ -1165,7 +1493,24 @@ function buildApp() {
       );
     }
 
-    if (tab === 'produksi') {
+    const counts = {
+      semua: hydrated.filter((o) => o.status_nota !== 'batal').length,
+      produksi: hydrated.filter(
+        (o) =>
+          activeOrderRaw(o) &&
+          o.status_nota !== 'batal' &&
+          !store.isOrderSiapDiambil(o) &&
+          !store.isOrderSelesai(o),
+      ).length,
+      siap_diambil: hydrated.filter((o) => o.status_nota !== 'batal' && store.isOrderSiapDiambil(o)).length,
+      selesai: hydrated.filter((o) => o.status_nota !== 'batal' && store.isOrderSelesai(o)).length,
+      batal: hydrated.filter((o) => o.status_nota === 'batal').length,
+      piutang: hydrated.filter((o) => activeOrderRaw(o) && o.status_nota !== 'batal' && o.sisa_tagihan > 0).length,
+    };
+
+    if (tab === 'semua') {
+      hydrated = hydrated.filter((o) => o.status_nota !== 'batal');
+    } else if (tab === 'produksi') {
       hydrated = hydrated.filter((o) => activeOrderRaw(o) && !store.isOrderSiapDiambil(o) && !store.isOrderSelesai(o));
     } else if (tab === 'siap_diambil') {
       hydrated = hydrated.filter((o) => store.isOrderSiapDiambil(o));
@@ -1177,7 +1522,7 @@ function buildApp() {
       hydrated = hydrated.filter((o) => activeOrderRaw(o) && o.sisa_tagihan > 0);
     }
 
-    res.json({ orders: hydrated });
+    res.json({ orders: hydrated, counts });
   });
 
   app.get('/api/orders/by-nota/:noNota', requireAuth(), (req, res) => {
@@ -1249,6 +1594,7 @@ function buildApp() {
       catatan_desain?: string;
       deadline?: string;
       diskon_persen?: number;
+      biaya_desain?: number;
       ppn_persen?: number;
       pph23_persen?: number;
       jatuh_tempo?: string;
@@ -1284,6 +1630,22 @@ function buildApp() {
     if (!Array.isArray(payload.items) || payload.items.length === 0) {
       res.status(422).json({ error: 'Minimal harus ada 1 item pada nota.' });
       return;
+    }
+    const parsedJatuhTempo = parseTanggalInput(payload.jatuh_tempo);
+    if (!parsedJatuhTempo.valid) {
+      res.status(422).json({ error: 'Format tanggal jatuh tempo tidak valid. Gunakan format YYYY-MM-DD.' });
+      return;
+    }
+    const parsedDeadline = parseTanggalInput(payload.deadline);
+    if (!parsedDeadline.valid) {
+      res.status(422).json({ error: 'Format tanggal deadline tidak valid. Gunakan format YYYY-MM-DD.' });
+      return;
+    }
+    if (payload.spk_enabled) {
+      if (!payload.spk_jenis_pekerjaan?.trim() || !payload.spk_ukuran_konstruksi?.trim() || !payload.spk_lokasi_pasang?.trim()) {
+        res.status(422).json({ error: 'Jenis pekerjaan, ukuran konstruksi, dan lokasi pasang SPK Advertising wajib diisi.' });
+        return;
+      }
     }
 
     // Resolve Instansi & Customer
@@ -1399,25 +1761,43 @@ function buildApp() {
         file_preview_acc: null,
         file_cetak_tiff: null,
         file_master_arsip: null,
+        preflight_dpi_ok: null,
+        preflight_cmyk_ok: null,
+        preflight_bleed_ok: null,
+        preflight_catatan: null,
         created_at: now,
         updated_at: now,
       });
     }
 
-    // Diskon nota + PPN/PPh 23 + jatuh tempo
+    const biayaDesain = round2(Math.max(0, Number(payload.biaya_desain ?? 0) || 0));
+    totalSebelumDiskonNota = round2(totalSebelumDiskonNota + biayaDesain);
+
+    // Diskon nota + PPN/PPh 23 (prioritas: payload > instansi > global tax_settings) + jatuh tempo
+    const taxSettings = db.tax_settings ?? buildDefaultTaxSettings();
     const diskonPersen = clampPercent(payload.diskon_persen);
-    const diskonNominal = round2((totalSebelumDiskonNota * diskonPersen) / 100);
-    const dpp = round2(totalSebelumDiskonNota - diskonNominal);
-    const defaultPpn = instansiObj.is_pkp ? Number(instansiObj.ppn_persen ?? 11) : Number(instansiObj.ppn_persen ?? 0);
-    const ppnPersen = clampPercent(payload.ppn_persen ?? defaultPpn);
-    const pph23Persen = clampPercent(payload.pph23_persen ?? instansiObj.pph23_persen ?? 0);
-    const ppnNominal = round2((dpp * ppnPersen) / 100);
-    const pph23Nominal = round2((dpp * pph23Persen) / 100);
-    const totalTagihan = round2(dpp + ppnNominal - pph23Nominal);
+    const { ppnPersen, pph23Persen } = computeEffectiveTaxRates({
+      payloadPpn: payload.ppn_persen,
+      payloadPph23: payload.pph23_persen,
+      instansi: instansiObj,
+      taxSettings,
+    });
+    const taxCalc = hitungPajakNota({
+      totalSebelumDiskonNota,
+      diskonNotaPersen: diskonPersen,
+      ppnPersen,
+      pph23Persen,
+      modeHarga: taxSettings.mode_harga,
+      ppnTermasukDiskon: taxSettings.ppn_termasuk_diskon,
+    });
+    const diskonNominal = taxCalc.diskonNominal;
+    const ppnNominal = taxCalc.ppnNominal;
+    const pph23Nominal = taxCalc.pph23Nominal;
+    const totalTagihan = taxCalc.totalTagihan;
 
     const tempoHari = Math.max(0, Math.floor(Number(instansiObj.tempo_hari ?? 0)) || 0);
-    const jatuhTempo = payload.jatuh_tempo
-      ? new Date(payload.jatuh_tempo).toISOString()
+    const jatuhTempo = parsedJatuhTempo.iso
+      ? parsedJatuhTempo.iso
       : tempoHari > 0
         ? new Date(Date.now() + tempoHari * 86400_000).toISOString()
         : null;
@@ -1473,6 +1853,7 @@ function buildApp() {
       designer_id: null,
       total_tagihan: totalTagihan,
       jumlah_dp: jumlahDp,
+      biaya_desain: biayaDesain,
       status_bayar: statusBayar,
       status_nota: 'aktif',
       alasan_batal: null,
@@ -1499,9 +1880,11 @@ function buildApp() {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: null,
-      deadline: payload.deadline ? new Date(payload.deadline).toISOString() : null,
+      deadline: parsedDeadline.iso,
       created_at: now,
       updated_at: now,
     };
@@ -1530,16 +1913,12 @@ function buildApp() {
     }
 
     if (payload.spk_enabled) {
-      if (!payload.spk_jenis_pekerjaan?.trim() || !payload.spk_ukuran_konstruksi?.trim() || !payload.spk_lokasi_pasang?.trim()) {
-        res.status(422).json({ error: 'Jenis pekerjaan, ukuran konstruksi, dan lokasi pasang SPK Advertising wajib diisi.' });
-        return;
-      }
       db.advertising_spks.push({
         id: store.nextId('advertising_spks'),
         order_id: orderId,
-        jenis_pekerjaan: payload.spk_jenis_pekerjaan.trim(),
-        ukuran_konstruksi: payload.spk_ukuran_konstruksi.trim(),
-        lokasi_pasang: payload.spk_lokasi_pasang.trim(),
+        jenis_pekerjaan: payload.spk_jenis_pekerjaan!.trim(),
+        ukuran_konstruksi: payload.spk_ukuran_konstruksi!.trim(),
+        lokasi_pasang: payload.spk_lokasi_pasang!.trim(),
         catatan_teknis: payload.spk_catatan_teknis?.trim() || null,
         status_lapangan: 'antrean',
         created_at: now,
@@ -1821,9 +2200,12 @@ function buildApp() {
       order.catatan_pengecualian =
         `VOID/REFUND: ${alasan}. Dana diterima Rp ${sudahDibayar.toLocaleString('id-ID')} wajib direfund.`;
     }
+    let cancelledItems = 0;
     for (const item of db.order_items) {
-      if (item.order_id === order.id && item.status_produksi !== 'selesai') {
+      if (item.order_id === order.id && item.status_produksi !== 'selesai' && item.status_produksi !== 'dibatalkan') {
+        item.status_produksi = 'dibatalkan';
         item.updated_at = now;
+        cancelledItems += 1;
       }
     }
     recordAudit(
@@ -1831,7 +2213,7 @@ function buildApp() {
       'order_void',
       'order',
       order.id,
-      `Nota ${order.no_nota} dibatalkan. Alasan: ${alasan}. Nilai dibayar Rp ${sudahDibayar.toLocaleString('id-ID')}`,
+      `Nota ${order.no_nota} dibatalkan. Alasan: ${alasan}. Nilai dibayar Rp ${sudahDibayar.toLocaleString('id-ID')}. Item dibatalkan: ${cancelledItems}`,
       clientIp(req),
     );
     store.persist();
@@ -1888,6 +2270,10 @@ function buildApp() {
         file_preview_acc: null,
         file_cetak_tiff: null,
         file_master_arsip: null,
+        preflight_dpi_ok: null,
+        preflight_cmyk_ok: null,
+        preflight_bleed_ok: null,
+        preflight_catatan: null,
         created_at: now,
         updated_at: now,
       });
@@ -1897,14 +2283,25 @@ function buildApp() {
       return;
     }
 
+    const biayaDesain = round2(Math.max(0, Number(source.biaya_desain ?? 0) || 0));
+    totalSebelumDiskonNota = round2(totalSebelumDiskonNota + biayaDesain);
+
+    const taxSettings = db.tax_settings ?? buildDefaultTaxSettings();
     const diskonPersen = clampPercent(source.diskon_persen);
-    const diskonNominal = round2((totalSebelumDiskonNota * diskonPersen) / 100);
-    const dpp = round2(totalSebelumDiskonNota - diskonNominal);
     const ppnPersen = clampPercent(source.ppn_persen);
     const pph23Persen = clampPercent(source.pph23_persen);
-    const ppnNominal = round2((dpp * ppnPersen) / 100);
-    const pph23Nominal = round2((dpp * pph23Persen) / 100);
-    const totalTagihan = round2(dpp + ppnNominal - pph23Nominal);
+    const taxCalc = hitungPajakNota({
+      totalSebelumDiskonNota,
+      diskonNotaPersen: diskonPersen,
+      ppnPersen,
+      pph23Persen,
+      modeHarga: taxSettings.mode_harga,
+      ppnTermasukDiskon: taxSettings.ppn_termasuk_diskon,
+    });
+    const diskonNominal = taxCalc.diskonNominal;
+    const ppnNominal = taxCalc.ppnNominal;
+    const pph23Nominal = taxCalc.pph23Nominal;
+    const totalTagihan = taxCalc.totalTagihan;
     const orderId = store.nextId('orders');
     const approvalToken = generateApprovalToken();
     const record: (typeof db.orders)[number] = {
@@ -1915,6 +2312,7 @@ function buildApp() {
       designer_id: null,
       total_tagihan: totalTagihan,
       jumlah_dp: 0,
+      biaya_desain: biayaDesain,
       status_bayar: 'belum_lunas',
       status_nota: 'aktif',
       alasan_batal: null,
@@ -1941,6 +2339,8 @@ function buildApp() {
       tanda_tangan_pengambil: null,
       nama_pengambil: null,
       no_wa_pengambil: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
       waktu_serah_terima: null,
       catatan_pengecualian: `Reorder dari ${source.no_nota}`,
       deadline: null,
@@ -2021,7 +2421,7 @@ function buildApp() {
         approval_note: order.approval_note ?? null,
         approved_by: order.tanda_tangan_admin ?? null,
         catatan_desain: order.catatan_desain ?? null,
-        lampiran_briefing: order.lampiran_briefing ?? null,
+        lampiran_briefing: toPublicPreviewUrl(order.lampiran_briefing, token),
         created_at: order.created_at,
         updated_at: order.updated_at,
         total_tagihan: disetujui ? order.total_tagihan : 0,
@@ -2055,10 +2455,13 @@ function buildApp() {
           diskon_persen: disetujui ? i.diskon_persen ?? 0 : 0,
           diskon_nominal: disetujui ? i.diskon_nominal ?? 0 : 0,
           subtotal: disetujui ? i.subtotal : 0,
-          file_preview_acc: i.file_preview_acc,
+          file_preview_acc: toPublicPreviewUrl(i.file_preview_acc, token),
           status_produksi: i.status_produksi,
         })),
-        design_revisions: order.design_revisions.slice(0, 5),
+        design_revisions: order.design_revisions.slice(0, 5).map((revision) => ({
+          ...revision,
+          file_preview: toPublicPreviewUrl(revision.file_preview, token),
+        })),
         payments: disetujui
           ? order.payments.map((p) => ({
               id: p.id,
@@ -2066,7 +2469,7 @@ function buildApp() {
               nominal: p.nominal,
               metode: p.metode,
               keterangan: p.keterangan ?? null,
-              bukti_bayar: p.bukti_bayar ?? null,
+              bukti_bayar: toPublicPreviewUrl(p.bukti_bayar, token),
               admin_name: p.admin_name ?? null,
             }))
           : [],
@@ -2115,9 +2518,16 @@ function buildApp() {
     order.updated_at = now;
     const items = db.order_items.filter((i) => i.order_id === order.id);
     if (decision === 'disetujui') {
-      // Persetujuan pelanggan dicatat; ACC internal tetap dijalankan Admin
+      // Persetujuan pelanggan dicatat terpisah pada item & nota; ACC internal tetap dijalankan Admin
       // agar desainer dapat mengunggah TIFF final sebelum masuk antrean cetak.
+      const namaPic = body.nama?.trim() || 'Pelanggan';
       order.tanda_tangan_admin = body.nama?.trim() || order.tanda_tangan_admin;
+      for (const item of items) {
+        item.acc_pelanggan_at = now;
+        item.acc_pelanggan_nama = namaPic;
+        item.acc_pelanggan_id = order.customer_id ?? null;
+        item.updated_at = now;
+      }
     } else {
       for (const item of items) {
         if (item.status_produksi === 'menunggu_acc' || item.status_produksi === 'proses_desain') {
@@ -2332,14 +2742,11 @@ function buildApp() {
       res.status(403).json({ error: 'Terima job terlebih dahulu sebelum mengunggah preview.' });
       return;
     }
-    const previewUrl = req.file
-      ? `/uploads/${req.file.filename}`
-      : String((req.body as { preset_url?: string }).preset_url ?? '').trim();
-
-    if (!previewUrl) {
-      res.status(422).json({ error: 'File gambar preview (JPG/PNG) wajib diunggah.' });
+    if (!req.file) {
+      res.status(422).json({ error: 'File gambar preview (JPG/PNG/WEBP) wajib diunggah.' });
       return;
     }
+    const previewUrl = `/uploads/${req.file.filename}`;
 
     const now = new Date().toISOString();
     for (const rev of db.design_revisions) {
@@ -2388,9 +2795,10 @@ function buildApp() {
       'preview_siap_acc',
       `preview_siap_acc:${order.id}:${previewUrl}`,
       previewOrder.customer?.no_wa ?? '',
-      `Preview desain Nota ${order.no_nota} siap di-ACC. Silakan cek tautan berikut.`,
+      `Preview desain Nota ${order.no_nota} siap di-ACC. Silakan cek & koreksi melalui tautan Self-ACC berikut.`,
       order.id,
       order.approval_token ? `${appBaseUrl()}/acc/${order.approval_token}` : `${appBaseUrl()}/?nota=${order.no_nota}`,
+      previewUrl,
     );
     res.json({ order: previewOrder });
   });
@@ -2399,16 +2807,37 @@ function buildApp() {
     const db = store.getState();
     const item = db.order_items.find((i) => i.id === Number(req.params.itemId));
     if (!item) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(404).json({ error: 'Item tidak ditemukan.' });
       return;
     }
     if (!item.acc_admin_id) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(422).json({ error: 'Item wajib disetujui (ACC) Admin terlebih dahulu sebelum unggah TIFF.' });
+      return;
+    }
+    if (req.file && !isTiffFilename(req.file.originalname)) {
+      cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: 'File cetak item wajib berformat .tif atau .tiff.' });
       return;
     }
     const tiffName = req.file
       ? `/uploads/${req.file.filename}`
       : String((req.body as { filename?: string }).filename ?? '').trim() || `cetak-item-${item.id}.tif`;
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const parseBool = (v: unknown) => {
+      if (v === undefined || v === null || v === '') return null;
+      if (typeof v === 'boolean') return v;
+      const s = String(v).trim().toLowerCase();
+      if (['true', '1', 'ya', 'yes', 'ok'].includes(s)) return true;
+      if (['false', '0', 'tidak', 'no'].includes(s)) return false;
+      return null;
+    };
+    if (body.preflight_dpi_ok !== undefined) item.preflight_dpi_ok = parseBool(body.preflight_dpi_ok);
+    if (body.preflight_cmyk_ok !== undefined) item.preflight_cmyk_ok = parseBool(body.preflight_cmyk_ok);
+    if (body.preflight_bleed_ok !== undefined) item.preflight_bleed_ok = parseBool(body.preflight_bleed_ok);
+    if (body.preflight_catatan !== undefined) item.preflight_catatan = String(body.preflight_catatan ?? '').trim() || null;
 
     item.file_cetak_tiff = tiffName;
     item.updated_at = new Date().toISOString();
@@ -2418,22 +2847,120 @@ function buildApp() {
     res.json({ order: store.hydrateOrder(order) });
   });
 
+  app.post(
+    '/api/desainer/orders/:id/tiff-massal',
+    requireAuth(['desainer']),
+    uploadBulkTiff.array('files', 30),
+    (req, res) => {
+      const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+      const db = store.getState();
+      const order = db.orders.find((o) => o.id === Number(req.params.id));
+      if (!order) {
+        cleanupUploadedFiles(files);
+        res.status(404).json({ error: 'Nota tidak ditemukan.' });
+        return;
+      }
+      if (files.length === 0) {
+        res.status(422).json({ error: 'Pilih minimal 1 file .TIFF untuk diunggah.' });
+        return;
+      }
+      let explicitMap: BulkTiffMapEntry[] | undefined;
+      const rawMap = (req.body as { peta?: unknown }).peta;
+      if (typeof rawMap === 'string' && rawMap.trim()) {
+        try {
+          const parsed = JSON.parse(rawMap);
+          if (Array.isArray(parsed)) explicitMap = parsed as BulkTiffMapEntry[];
+        } catch {
+          cleanupUploadedFiles(files);
+          res.status(422).json({ error: 'Format peta pemetaan file TIFF tidak valid.' });
+          return;
+        }
+      }
+      const orderItems = db.order_items.filter((i) => i.order_id === order.id);
+      const hydratedItems = orderItems.map((i) => store.hydrateItem(i));
+      const resolution = resolveBulkTiffMapping({
+        filenames: files.map((f) => f.originalname),
+        items: hydratedItems,
+        explicitMap,
+      });
+      if (!resolution.ok) {
+        cleanupUploadedFiles(files);
+        res.status(422).json({
+          error:
+            resolution.errors[0] ||
+            `File berikut belum memiliki pasangan item yang valid: ${resolution.unmapped.join(', ')}`,
+          unmapped: resolution.unmapped,
+          errors: resolution.errors,
+        });
+        return;
+      }
+
+      const fileByOriginal = new Map(files.map((f) => [f.originalname, f]));
+      const now = new Date().toISOString();
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const parseBool = (v: unknown) => {
+        if (v === undefined || v === null || v === '') return null;
+        if (typeof v === 'boolean') return v;
+        const s = String(v).trim().toLowerCase();
+        if (['true', '1', 'ya', 'yes', 'ok'].includes(s)) return true;
+        if (['false', '0', 'tidak', 'no'].includes(s)) return false;
+        return null;
+      };
+      const preflight = {
+        dpi: body.preflight_dpi_ok !== undefined ? parseBool(body.preflight_dpi_ok) : undefined,
+        cmyk: body.preflight_cmyk_ok !== undefined ? parseBool(body.preflight_cmyk_ok) : undefined,
+        bleed: body.preflight_bleed_ok !== undefined ? parseBool(body.preflight_bleed_ok) : undefined,
+        catatan: body.preflight_catatan !== undefined ? (String(body.preflight_catatan ?? '').trim() || null) : undefined,
+      };
+      for (const pair of resolution.mappings) {
+        const file = fileByOriginal.get(pair.filename)!;
+        const target = orderItems.find((i) => i.id === pair.itemId)!;
+        target.file_cetak_tiff = `/uploads/${file.filename}`;
+        if (preflight.dpi !== undefined) target.preflight_dpi_ok = preflight.dpi;
+        if (preflight.cmyk !== undefined) target.preflight_cmyk_ok = preflight.cmyk;
+        if (preflight.bleed !== undefined) target.preflight_bleed_ok = preflight.bleed;
+        if (preflight.catatan !== undefined) target.preflight_catatan = preflight.catatan;
+        target.updated_at = now;
+      }
+      order.updated_at = now;
+      auditRequest(
+        req,
+        'tiff_massal_upload',
+        'order',
+        order.id,
+        `${resolution.mappings.length} file TIFF diunggah massal untuk Nota ${order.no_nota}.`,
+      );
+      store.persist();
+      broadcastEvent('design_updated', { orderId: order.id });
+      res.json({ order: store.hydrateOrder(order), uploaded: resolution.mappings.length });
+    },
+  );
+
   app.post('/api/desainer/orders/:id/master', requireAuth(['desainer']), upload.single('file_master_arsip'), (req, res) => {
     const desainer = getCurrentUser(req);
     const db = store.getState();
     const order = db.orders.find((o) => o.id === Number(req.params.id));
     if (!order) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(404).json({ error: 'Nota tidak ditemukan.' });
       return;
     }
     const items = db.order_items.filter((i) => i.order_id === order.id);
     if (items.length === 0 || !items.every((i) => Boolean(i.file_cetak_tiff))) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(422).json({ error: 'Seluruh item dalam nota wajib memiliki file cetak .TIFF sebelum finalisasi master.' });
       return;
     }
-    const masterFile = req.file
-      ? `/uploads/${req.file.filename}`
-      : String((req.body as { filename?: string }).filename ?? '').trim() || `MASTER-${order.no_nota}.cdr`;
+    if (!req.file) {
+      res.status(422).json({ error: 'Wajib mengunggah file master editable (.AI / .PSD / .CDR) saat finalisasi master.' });
+      return;
+    }
+    if (!isEditableMasterFilename(req.file.originalname)) {
+      cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: 'Format master wajib editable (.ai, .psd, atau .cdr). Format lain ditolak.' });
+      return;
+    }
+    const masterFile = `/uploads/${req.file.filename}`;
     const ttd = String((req.body as { tanda_tangan?: string }).tanda_tangan ?? '').trim() || desainer.name;
     const now = new Date().toISOString();
 
@@ -2453,11 +2980,72 @@ function buildApp() {
     res.json({ order: store.hydrateOrder(order) });
   });
 
+  const mesinUtamaCetak = (db: DbState, product?: { mesin_default_id?: number | null } | null) => {
+    const aktif = db.machines.find((m) => m.aktif);
+    if (aktif) return aktif;
+    if (product?.mesin_default_id) {
+      return db.machines.find((m) => m.id === product.mesin_default_id) ?? null;
+    }
+    return null;
+  };
+
+  const catatTintaPerWarna = (
+    db: DbState,
+    params: {
+      warnaIds: number[];
+      luasCetakM2: number;
+      orderItemId: number;
+      grupId: number | null;
+      now: string;
+    },
+  ): { totalMl: number; rincian: Array<{ warna: string; jumlah_ml: number }>; peringatan: string | null } => {
+    const ids = [...new Set(params.warnaIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+    if (ids.length === 0) {
+      return { totalMl: 0, rincian: [], peringatan: null };
+    }
+    const warnaList = ids
+      .map((id) => db.tinta_warna.find((w) => w.id === id && w.aktif))
+      .filter((w): w is DbState['tinta_warna'][number] => Boolean(w))
+      .map((w) => ({
+        id: w.id,
+        warna: w.warna,
+        konsumsi_ml_per_m2: Number(w.konsumsi_ml_per_m2 ?? 0) || hitungTintaMlPerM2(),
+      }));
+    const hitung = hitungPemakaianTintaPerWarna(params.luasCetakM2, warnaList);
+    let peringatan: string | null = null;
+    const rincian: Array<{ warna: string; jumlah_ml: number }> = [];
+    for (const row of hitung.rincian) {
+      const tinta = db.tinta_warna.find((w) => w.id === row.tinta_warna_id);
+      if (!tinta) continue;
+      const pakai = Math.min(Number(tinta.stok_ml ?? 0), row.jumlah_ml);
+      tinta.stok_ml = round2(Number(tinta.stok_ml ?? 0) - pakai);
+      tinta.updated_at = params.now;
+      if (pakai + 0.001 < row.jumlah_ml) {
+        peringatan = `Stok tinta ${tinta.warna} tidak mencukupi; pemakaian dibatasi.`;
+      }
+      db.pemakaian_tinta.push({
+        id: store.nextId('pemakaian_tinta'),
+        order_item_id: params.orderItemId,
+        grup_id: params.grupId,
+        tinta_warna_id: tinta.id,
+        warna: tinta.warna,
+        jumlah_ml: round2(pakai),
+        luas_cetak_m2: round2(params.luasCetakM2),
+        created_at: params.now,
+      });
+      rincian.push({ warna: tinta.warna, jumlah_ml: round2(pakai) });
+    }
+    if (warnaList.length < ids.length) {
+      peringatan = peringatan ?? 'Sebagian warna tinta tidak aktif atau tidak ditemukan.';
+    }
+    return { totalMl: round2(rincian.reduce((sum, r) => sum + r.jumlah_ml, 0)), rincian, peringatan };
+  };
+
   // --- OPERATOR CETAK WORKFLOW ---
   app.get('/api/operator/queue', requireAuth(['operator_cetak']), (_req, res) => {
     const db = store.getState();
     const items = db.order_items
-      .filter((i) => i.status_produksi === 'antrean_cetak' || i.status_produksi === 'proses_cetak')
+      .filter((i) => ['antrean_cetak', 'siap_tata', 'proses_cetak', 'gagal_cetak', 'cetak_ulang'].includes(i.status_produksi))
       .filter((i) => {
         const order = db.orders.find((o) => o.id === i.order_id);
         return order ? activeOrderRaw(order) : false;
@@ -2480,6 +3068,19 @@ function buildApp() {
       machines: db.machines.filter((m) => m.aktif),
       supplies: db.supplies.filter((s) => s.aktif),
       batches: db.print_batches.slice(-20).reverse(),
+      cattoffs: db.stok_cattoff.filter((c) => c.status === 'aktif'),
+      tinta_warna: db.tinta_warna.filter((w) => w.aktif),
+      grup: db.cetak_grup.slice(-20).reverse().map((g) => ({
+        ...g,
+        operator_name: db.users.find((u) => u.id === g.operator_id)?.name ?? null,
+        machine_name: db.machines.find((m) => m.id === g.machine_id)?.nama_mesin ?? null,
+        items: db.cetak_grup_item.filter((gi) => gi.grup_id === g.id).map((gi) => ({
+          ...gi,
+          no_nota: db.orders.find((o) => o.id === db.order_items.find((it) => it.id === gi.order_item_id)?.order_id)?.no_nota ?? '-',
+          nama_item: db.order_items.find((it) => it.id === gi.order_item_id)?.nama_item ?? null,
+          qty_order: db.order_items.find((it) => it.id === gi.order_item_id)?.qty ?? 0,
+        })),
+      })),
     });
   });
 
@@ -2487,15 +3088,14 @@ function buildApp() {
     const operator = getCurrentUser(req);
     const db = store.getState();
     const item = db.order_items.find((i) => i.id === Number(req.params.id));
-    if (!item || item.status_produksi !== 'antrean_cetak') {
-      res.status(403).json({ error: 'Item tidak berada pada status Antrean Cetak.' });
+    if (!item || !['antrean_cetak', 'siap_tata', 'gagal_cetak', 'cetak_ulang'].includes(item.status_produksi)) {
+      res.status(403).json({ error: 'Item tidak berada pada status siap cetak.' });
       return;
     }
     const product = db.products.find((p) => p.id === item.product_id);
-    const machineId = Number((req.body as { machine_id?: number }).machine_id ?? item.machine_id ?? product?.mesin_default_id ?? 0);
-    const machine = db.machines.find((m) => m.id === machineId && m.aktif);
+    const machine = mesinUtamaCetak(db, product);
     if (!machine) {
-      res.status(422).json({ error: 'Pilih mesin cetak aktif yang akan dipakai.' });
+      res.status(422).json({ error: 'Mesin cetak aktif belum tersedia.' });
       return;
     }
     const now = new Date().toISOString();
@@ -2509,10 +3109,46 @@ function buildApp() {
     res.json({ item: store.hydrateItem(item) });
   });
 
-  app.post('/api/operator/items/:id/selesai', requireAuth(['operator_cetak']), (req, res) => {
+  app.post('/api/operator/items/:id/siap-tata', requireAuth(['operator_cetak']), (req, res) => {
+    const operator = getCurrentUser(req);
+    const db = store.getState();
+    const item = db.order_items.find((i) => i.id === parsePositiveId(req.params.id));
+    if (!item || !['antrean_cetak', 'cetak_ulang'].includes(item.status_produksi)) {
+      res.status(422).json({ error: 'Item tidak berada di antrean penataan.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    item.status_produksi = 'siap_tata';
+    item.ditata_at = now;
+    item.operator_id = operator.id;
+    item.updated_at = now;
+    store.persist();
+    auditRequest(req, 'operator_siap_tata', 'order_item', item.id, `${operator.name} menandai ${item.nama_item ?? 'item'} siap ditata.`);
+    broadcastEvent('production_updated', { orderId: item.order_id });
+    res.json({ item: store.hydrateItem(item) });
+  });
+
+  app.post('/api/operator/items/:id/selesai', requireAuth(['operator_cetak']), async (req, res) => {
+    await runTransactional(
+      res,
+      () =>
+        store.critical(
+          [
+            'order_items', 'material_rolls', 'material_offcuts', 'stok_cattoff',
+            'products', 'supplies', 'tinta_warna', 'pemakaian_tinta', 'audit_logs',
+          ],
+          () => {
     const db = store.getState();
     const item = db.order_items.find((i) => i.id === Number(req.params.id));
-    if (!item || !['antrean_cetak', 'proses_cetak'].includes(item.status_produksi)) {
+    if (!item) {
+      res.status(404).json({ error: 'Item tidak ditemukan.' });
+      return;
+    }
+    if (item.status_produksi === 'gagal_cetak') {
+      res.status(422).json({ error: 'Item berstatus Gagal Cetak wajib dimulai cetak ulang sebelum diselesaikan.' });
+      return;
+    }
+    if (!['antrean_cetak', 'siap_tata', 'proses_cetak', 'cetak_ulang'].includes(item.status_produksi)) {
       res.status(403).json({ error: 'Item tidak berada di antrean cetak.' });
       return;
     }
@@ -2531,40 +3167,69 @@ function buildApp() {
     const {
       sumber_bahan,
       material_roll_id,
+      cattoff_id,
       material_offcut_id,
       orientasi_potong,
-      machine_id,
+      panjang_file_m,
+      lebar_file_m,
+      offcut_lebar_m,
+      offcut_panjang_m,
+      warna_tinta_ids,
     } = req.body as {
-      sumber_bahan?: 'roll' | 'offcut';
+      sumber_bahan?: 'roll' | 'cattoff' | 'offcut';
       material_roll_id?: number;
+      cattoff_id?: number;
       material_offcut_id?: number;
       orientasi_potong?: 'panjang' | 'lebar';
-      machine_id?: number;
+      panjang_file_m?: number;
+      lebar_file_m?: number;
+      offcut_lebar_m?: number;
+      offcut_panjang_m?: number;
+      warna_tinta_ids?: number[];
     };
 
-    const machineId = Number(machine_id ?? item.machine_id ?? product.mesin_default_id ?? 0);
-    const machine = db.machines.find((m) => m.id === machineId && m.aktif) ?? null;
+    const machine = mesinUtamaCetak(db, product);
     if (!machine) {
       res.status(422).json({ error: 'Mesin cetak aktif belum ditentukan untuk item ini.' });
       return;
     }
 
     const now = new Date().toISOString();
+    // Sisa qty yang belum tercetak. Untuk cetak ulang, QC sudah mereset
+    // qty_tercetak ke 0 sehingga seluruh qty dicetak ulang.
+    const qtySisa = Math.max(1, Math.floor(Number(item.qty) || 1) - (Number(item.qty_tercetak) || 0));
     let luasCetakM2 = 0;
+    let catatanBahan = '';
     if (product.kategori_produk === 'meteran') {
       const finishing = item.finishing_id
         ? db.finishings.find((f) => f.id === item.finishing_id) ?? null
         : null;
-      const ukuranKotor = computeUkuranKotor(item.lebar_m ?? 0, item.tinggi_m ?? 0, item.qty, finishing);
+      const ukuranKotor = computeUkuranKotor(item.lebar_m ?? 0, item.tinggi_m ?? 0, qtySisa, finishing);
+      const panjangFile = Math.max(0, round2(Number(panjang_file_m ?? 0)));
+      const lebarFile = Math.max(0, round2(Number(lebar_file_m ?? 0)));
+      const pakaiFile = panjangFile > 0 && lebarFile > 0;
       const orientasi = orientasi_potong === 'lebar' ? 'lebar' : 'panjang';
-      const panjangPakai = round2(orientasi === 'lebar' ? ukuranKotor.lebar * item.qty : ukuranKotor.tinggi * item.qty);
-      const lebarPakai = round2(orientasi === 'lebar' ? ukuranKotor.tinggi : ukuranKotor.lebar);
-      const luasNetto = round2((item.lebar_m ?? 0) * (item.tinggi_m ?? 0) * item.qty);
+      const panjangPakai = pakaiFile
+        ? round2(panjangFile * qtySisa)
+        : round2(orientasi === 'lebar' ? ukuranKotor.lebar * qtySisa : ukuranKotor.tinggi * qtySisa);
+      const lebarPakai = pakaiFile
+        ? lebarFile
+        : round2(orientasi === 'lebar' ? ukuranKotor.tinggi : ukuranKotor.lebar);
+      const luasNetto = pakaiFile
+        ? round2(panjangFile * lebarFile * qtySisa)
+        : round2((item.lebar_m ?? 0) * (item.tinggi_m ?? 0) * qtySisa);
+      if (!(panjangPakai > 0) || !(lebarPakai > 0)) {
+        res.status(422).json({ error: 'Dimensi file .prn tidak valid.' });
+        return;
+      }
       luasCetakM2 = luasNetto;
       const wosFinishing = round2(Math.max(ukuranKotor.luas - luasNetto, 0));
-      let wosPotong = 0;
+      const offLebar = Math.max(0, round2(Number(offcut_lebar_m ?? 0)));
+      const offPanjangInput = Math.max(0, round2(Number(offcut_panjang_m ?? 0)));
+      let containerWidthM = 0;
       let rollId: number | null = null;
       let offcutId: number | null = null;
+      let cattoffId: number | null = null;
 
       if (sumber_bahan === 'offcut') {
         const offcut = db.material_offcuts.find((o) => o.id === Number(material_offcut_id));
@@ -2582,6 +3247,29 @@ function buildApp() {
         }
         offcut.status = 'terpakai';
         offcutId = offcut.id;
+        containerWidthM = offcut.lebar_m;
+        catatanBahan = `offcut ${offcut.kode_roll ?? offcut.id}`;
+      } else if (sumber_bahan === 'cattoff') {
+        const cattoff = db.stok_cattoff.find((c) => c.id === Number(cattoff_id));
+        if (!cattoff || cattoff.status !== 'aktif') {
+          res.status(422).json({ error: 'Stok cattoff aktif wajib dipilih.' });
+          return;
+        }
+        if (cattoff.lebar_m + 0.001 < lebarPakai) {
+          res.status(422).json({ error: `Lebar cattoff (${cattoff.lebar_m} m) kurang dari kebutuhan (${lebarPakai} m).` });
+          return;
+        }
+        if (cattoff.panjang_sisa_m + 0.001 < panjangPakai) {
+          res.status(422).json({ error: `Sisa panjang cattoff (${cattoff.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).` });
+          return;
+        }
+        const sisa = round2(cattoff.panjang_sisa_m - panjangPakai);
+        cattoff.panjang_sisa_m = sisa;
+        cattoff.status = sisa <= 0 ? 'habis' : 'aktif';
+        cattoff.updated_at = now;
+        cattoffId = cattoff.id;
+        containerWidthM = cattoff.lebar_m;
+        catatanBahan = `cattoff ${cattoff.kode}`;
       } else {
         const roll = db.material_rolls.find((r) => r.id === Number(material_roll_id));
         if (!roll || roll.status !== 'aktif') {
@@ -2600,23 +3288,33 @@ function buildApp() {
         roll.panjang_sisa_m = sisaRoll;
         roll.status = sisaRoll <= 0 ? 'habis' : 'aktif';
         rollId = roll.id;
+        containerWidthM = roll.lebar_m;
+        catatanBahan = `roll ${roll.kode_roll}`;
+      }
 
-        const sisaLebar = round2(roll.lebar_m - lebarPakai);
-        if (sisaLebar >= 0.5) {
-          db.material_offcuts.push({
-            id: store.nextId('material_offcuts'),
-            material_roll_id: roll.id,
-            kode_roll: roll.kode_roll,
-            jenis_bahan: roll.jenis_bahan,
-            lebar_m: sisaLebar,
-            panjang_m: panjangPakai,
-            luas_m2: round2(sisaLebar * panjangPakai),
-            status: 'tersedia',
-            created_at: now,
-          });
-        } else {
-          wosPotong = round2(Math.max(sisaLebar, 0) * panjangPakai);
-        }
+      const offPanjang = offPanjangInput > 0 ? offPanjangInput : offLebar > 0 ? panjangPakai : 0;
+      const hitungBahan = hitungPemakaianBahanPrn({
+        panjangFileM: panjangPakai,
+        lebarFileM: lebarPakai,
+        containerWidthM,
+        manualOffcutLebarM: offLebar,
+        manualOffcutPanjangM: offPanjang,
+      });
+      if (hitungBahan.createsManualOffcut) {
+        const sourceRoll = rollId ? db.material_rolls.find((r) => r.id === rollId) : null;
+        const sourceCattoff = cattoffId ? db.stok_cattoff.find((c) => c.id === cattoffId) : null;
+        db.material_offcuts.push({
+          id: store.nextId('material_offcuts'),
+          material_roll_id: rollId,
+          kode_roll: sourceRoll?.kode_roll ?? sourceCattoff?.kode ?? null,
+          jenis_bahan: sourceRoll?.jenis_bahan ?? sourceCattoff?.jenis_bahan ?? product.nama_produk,
+          lebar_m: offLebar,
+          panjang_m: offPanjang,
+          luas_m2: round2(offLebar * offPanjang),
+          status: 'tersedia',
+          created_at: now,
+        });
+        offcutId = db.material_offcuts[db.material_offcuts.length - 1].id;
       }
 
       db.material_logs.push({
@@ -2626,50 +3324,61 @@ function buildApp() {
         material_offcut_id: offcutId,
         luas_netto_m2: luasNetto,
         wos_finishing_m2: wosFinishing,
-        wos_potong_m2: wosPotong,
+        wos_potong_m2: hitungBahan.wosPotongM2,
         gagal_cetak_m2: 0,
-        keterangan: `Selesai cetak | ${product.nama_produk} | ${panjangPakai} m`,
+        keterangan: `Selesai cetak | ${product.nama_produk} | ${panjangPakai} m | ${catatanBahan}`,
         created_at: now,
       });
     } else {
       if (product.stok_pcs !== null) {
-        if (product.stok_pcs < item.qty) {
+        if (product.stok_pcs < qtySisa) {
           res.status(422).json({ error: `Stok produk satuan ${product.nama_produk} tidak mencukupi.` });
           return;
         }
-        product.stok_pcs -= item.qty;
+        product.stok_pcs -= qtySisa;
       }
       if ((product.satuan_hitung ?? 'pcs') === 'klik') {
-        luasCetakM2 = round2(item.qty * A3_PLUS_AREA_M2);
+        luasCetakM2 = round2(qtySisa * A3_PLUS_AREA_M2);
       }
     }
 
     const klikTotal =
       (product.satuan_hitung ?? 'pcs') === 'klik'
-        ? item.qty * (product.klik_per_lembar ?? 1)
+        ? qtySisa * (product.klik_per_lembar ?? 1)
         : null;
-    const estimasiTinta = round2(luasCetakM2 * (machine.konsumsi_tinta_ml_per_m2 ?? 0));
-    let peringatanStok: string | null = null;
-    if (estimasiTinta > 0) {
-      const ink = selectInkSupply(db, machine);
-      if (!ink) {
-        peringatanStok = 'Stok tinta tidak tersedia; estimasi tetap dicatat.';
-      } else {
-        const pakai = round2(Math.min(ink.stok, estimasiTinta));
-        ink.stok = round2(ink.stok - pakai);
-        ink.updated_at = now;
-        db.supply_usages.push({
-          id: store.nextId('supply_usages'),
-          supply_id: ink.id,
-          order_item_id: item.id,
-          jumlah: pakai,
-          satuan: ink.satuan,
-          keterangan: `Estimasi tinta cetak | ${product.nama_produk} | ${machine.nama_mesin}`,
-          user_id: getCurrentUser(req).id,
-          created_at: now,
-        });
-        if (pakai + 0.001 < estimasiTinta) {
-          peringatanStok = `Stok ${ink.nama} hanya ${ink.stok.toLocaleString('id-ID')} ${ink.satuan}; pemakaian dibatasi.`;
+    const idsTinta = Array.isArray(warna_tinta_ids) ? warna_tinta_ids : [];
+    const tintaPerWarna = catatTintaPerWarna(db, {
+      warnaIds: idsTinta,
+      luasCetakM2,
+      orderItemId: item.id,
+      grupId: null,
+      now,
+    });
+    let estimasiTinta = tintaPerWarna.totalMl;
+    let peringatanStok = tintaPerWarna.peringatan;
+    if (idsTinta.length === 0) {
+      estimasiTinta = round2(luasCetakM2 * (machine.konsumsi_tinta_ml_per_m2 ?? 0));
+      if (estimasiTinta > 0) {
+        const ink = selectInkSupply(db, machine);
+        if (!ink) {
+          peringatanStok = 'Stok tinta tidak tersedia; estimasi tetap dicatat.';
+        } else {
+          const pakai = round2(Math.min(ink.stok, estimasiTinta));
+          ink.stok = round2(ink.stok - pakai);
+          ink.updated_at = now;
+          db.supply_usages.push({
+            id: store.nextId('supply_usages'),
+            supply_id: ink.id,
+            order_item_id: item.id,
+            jumlah: pakai,
+            satuan: ink.satuan,
+            keterangan: `Estimasi tinta cetak | ${product.nama_produk} | ${machine.nama_mesin}`,
+            user_id: getCurrentUser(req).id,
+            created_at: now,
+          });
+          if (pakai + 0.001 < estimasiTinta) {
+            peringatanStok = `Stok ${ink.nama} hanya ${ink.stok.toLocaleString('id-ID')} ${ink.satuan}; pemakaian dibatasi.`;
+          }
         }
       }
     }
@@ -2678,6 +3387,7 @@ function buildApp() {
     item.operator_id = getCurrentUser(req).id;
     item.klik_total = klikTotal;
     item.estimasi_tinta_ml = estimasiTinta;
+    item.qty_tercetak = item.qty;
     item.waktu_mulai_cetak = item.waktu_mulai_cetak ?? now;
     item.waktu_selesai_cetak = now;
     item.status_produksi = item.finishing_id ? 'antrean_finishing' : 'siap_diambil';
@@ -2685,13 +3395,443 @@ function buildApp() {
     store.persist();
     broadcastEvent('production_updated', { orderId: item.order_id });
     enqueueSiapDiambil(item.order_id);
-    res.json({ item: store.hydrateItem(item), estimasi_tinta_ml: estimasiTinta, klik_total: klikTotal, peringatan_stok: peringatanStok });
+    res.json({
+      item: store.hydrateItem(item),
+      estimasi_tinta_ml: estimasiTinta,
+      rincian_tinta: tintaPerWarna.rincian,
+      klik_total: klikTotal,
+      peringatan_stok: peringatanStok,
+    });
+          },
+        ),
+      'Gagal menyelesaikan cetak secara transaksional.',
+    );
   });
 
-  app.post('/api/operator/items/:id/gagal-cetak', requireAuth(['operator_cetak']), (req, res) => {
+  const hydrateGrupCetak = (db: DbState, grup: DbState['cetak_grup'][number]) => ({
+    ...grup,
+    operator_name: db.users.find((u) => u.id === grup.operator_id)?.name ?? null,
+    machine_name: db.machines.find((m) => m.id === grup.machine_id)?.nama_mesin ?? null,
+    items: db.cetak_grup_item
+      .filter((gi) => gi.grup_id === grup.id)
+      .map((gi) => {
+        const orderItem = db.order_items.find((it) => it.id === gi.order_item_id);
+        return {
+          ...gi,
+          no_nota: orderItem ? db.orders.find((o) => o.id === orderItem.order_id)?.no_nota ?? '-' : '-',
+          nama_item: orderItem?.nama_item ?? null,
+          qty_order: orderItem?.qty ?? 0,
+        };
+      }),
+  });
+
+  const prosesSelesaiGrupItem = (
+    db: DbState,
+    grup: DbState['cetak_grup'][number],
+    gi: DbState['cetak_grup_item'][number],
+    now: string,
+    operatorId: number,
+    warnaIds: number[],
+  ): string | null => {
+    const item = db.order_items.find((i) => i.id === gi.order_item_id);
+    if (!item) return 'Item pesanan tidak ditemukan.';
+    const parentOrder = db.orders.find((o) => o.id === item.order_id);
+    if (!parentOrder || !activeOrderRaw(parentOrder)) return 'Nota sudah dibatalkan (void).';
+    const product = db.products.find((p) => p.id === item.product_id);
+    if (!product) return 'Produk tidak ditemukan.';
+
+    const qty = Math.max(1, Math.floor(Number(gi.qty_cetak ?? item.qty ?? 1)));
+    const finishing = item.finishing_id
+      ? db.finishings.find((f) => f.id === item.finishing_id) ?? null
+      : null;
+    const ukuranKotor = computeUkuranKotor(item.lebar_m ?? 0, item.tinggi_m ?? 0, qty, finishing);
+    const panjangFile = Number(gi.panjang_file_m ?? 0) > 0
+      ? round2(Number(gi.panjang_file_m))
+      : round2(ukuranKotor.tinggi);
+    const lebarFile = Number(gi.lebar_file_m ?? 0) > 0
+      ? round2(Number(gi.lebar_file_m))
+      : round2(ukuranKotor.lebar);
+    const panjangPakai = round2(panjangFile * qty);
+    const luasNetto = round2(panjangFile * lebarFile * qty);
+    const wosFinishing = round2(Math.max(ukuranKotor.luas - luasNetto, 0));
+    if (!(panjangPakai > 0) || !(lebarFile > 0)) return 'Dimensi file .prn tidak valid.';
+
+    const offLebar = Math.max(0, round2(Number(gi.offcut_lebar_m ?? 0)));
+    const offPanjangInput = Math.max(0, round2(Number(gi.offcut_panjang_m ?? 0)));
+    let containerWidthM = 0;
+    let rollId: number | null = null;
+    let offcutId: number | null = null;
+    let cattoffId: number | null = null;
+
+    if (gi.sumber_bahan === 'offcut') {
+      const offcut = gi.offcut_id
+        ? db.material_offcuts.find((o) => o.id === gi.offcut_id)
+        : db.material_offcuts.find((o) => o.status === 'tersedia' && o.lebar_m + 0.001 >= lebarFile && o.panjang_m + 0.001 >= panjangPakai);
+      if (!offcut || offcut.status !== 'tersedia') return 'Stok potongan (offcut) tidak tersedia.';
+      if (offcut.lebar_m + 0.001 < lebarFile) return `Lebar potongan (${offcut.lebar_m} m) kurang dari kebutuhan (${lebarFile} m).`;
+      if (offcut.panjang_m + 0.001 < panjangPakai) return `Panjang potongan (${offcut.panjang_m} m) kurang dari kebutuhan (${panjangPakai} m).`;
+      offcut.status = 'terpakai';
+      offcutId = offcut.id;
+      gi.offcut_id = offcut.id;
+      containerWidthM = offcut.lebar_m;
+    } else if (gi.sumber_bahan === 'cattoff') {
+      const cattoff = gi.cattoff_id
+        ? db.stok_cattoff.find((c) => c.id === gi.cattoff_id)
+        : db.stok_cattoff.find((c) => c.status === 'aktif' && c.lebar_m + 0.001 >= lebarFile && c.panjang_sisa_m + 0.001 >= panjangPakai);
+      if (!cattoff || cattoff.status !== 'aktif') return 'Stok cattoff aktif tidak tersedia.';
+      if (cattoff.lebar_m + 0.001 < lebarFile) return `Lebar cattoff (${cattoff.lebar_m} m) kurang dari kebutuhan (${lebarFile} m).`;
+      if (cattoff.panjang_sisa_m + 0.001 < panjangPakai) return `Sisa cattoff (${cattoff.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).`;
+      const sisa = round2(cattoff.panjang_sisa_m - panjangPakai);
+      cattoff.panjang_sisa_m = sisa;
+      cattoff.status = sisa <= 0 ? 'habis' : 'aktif';
+      cattoff.updated_at = now;
+      cattoffId = cattoff.id;
+      gi.cattoff_id = cattoff.id;
+      containerWidthM = cattoff.lebar_m;
+    } else {
+      const roll = gi.roll_id
+        ? db.material_rolls.find((r) => r.id === gi.roll_id)
+        : db.material_rolls.find((r) => r.status === 'aktif' && r.lebar_m + 0.001 >= lebarFile && r.panjang_sisa_m + 0.001 >= panjangPakai);
+      if (!roll || roll.status !== 'aktif') return 'Roll bahan aktif tidak tersedia.';
+      if (roll.lebar_m + 0.001 < lebarFile) return `Lebar roll (${roll.lebar_m} m) kurang dari kebutuhan (${lebarFile} m).`;
+      if (roll.panjang_sisa_m + 0.001 < panjangPakai) return `Sisa roll (${roll.panjang_sisa_m} m) tidak mencukupi (${panjangPakai} m).`;
+      const sisa = round2(roll.panjang_sisa_m - panjangPakai);
+      roll.panjang_sisa_m = sisa;
+      roll.status = sisa <= 0 ? 'habis' : 'aktif';
+      rollId = roll.id;
+      gi.roll_id = roll.id;
+      containerWidthM = roll.lebar_m;
+    }
+
+    const offPanjang = offPanjangInput > 0 ? offPanjangInput : offLebar > 0 ? panjangPakai : 0;
+    const hitungBahan = hitungPemakaianBahanPrn({
+      panjangFileM: panjangPakai,
+      lebarFileM: lebarFile,
+      containerWidthM,
+      manualOffcutLebarM: offLebar,
+      manualOffcutPanjangM: offPanjang,
+    });
+    if (hitungBahan.createsManualOffcut) {
+      const sourceRoll = rollId ? db.material_rolls.find((r) => r.id === rollId) : null;
+      const sourceCattoff = cattoffId ? db.stok_cattoff.find((c) => c.id === cattoffId) : null;
+      db.material_offcuts.push({
+        id: store.nextId('material_offcuts'),
+        material_roll_id: rollId,
+        kode_roll: sourceRoll?.kode_roll ?? sourceCattoff?.kode ?? null,
+        jenis_bahan: sourceRoll?.jenis_bahan ?? sourceCattoff?.jenis_bahan ?? product.nama_produk,
+        lebar_m: offLebar,
+        panjang_m: offPanjang,
+        luas_m2: round2(offLebar * offPanjang),
+        status: 'tersedia',
+        created_at: now,
+      });
+      offcutId = db.material_offcuts[db.material_offcuts.length - 1].id;
+      gi.offcut_id = offcutId;
+    }
+
+    db.material_logs.push({
+      id: store.nextId('material_logs'),
+      order_item_id: item.id,
+      material_roll_id: rollId,
+      material_offcut_id: offcutId,
+      luas_netto_m2: luasNetto,
+      wos_finishing_m2: wosFinishing,
+      wos_potong_m2: hitungBahan.wosPotongM2,
+      gagal_cetak_m2: 0,
+      keterangan: `Selesai cetak grup ${grup.kode_grup} | ${product.nama_produk} | ${panjangPakai} m`,
+      created_at: now,
+    });
+
+    const tinta = catatTintaPerWarna(db, {
+      warnaIds,
+      luasCetakM2: luasNetto,
+      orderItemId: item.id,
+      grupId: grup.id,
+      now,
+    });
+    gi.masuk_wos_m2 = hitungBahan.wosPotongM2;
+    gi.status = 'selesai';
+    gi.updated_at = now;
+    item.qty_tercetak = round2((item.qty_tercetak ?? 0) + qty);
+    item.machine_id = grup.machine_id;
+    item.operator_id = operatorId;
+    item.estimasi_tinta_ml = round2((item.estimasi_tinta_ml ?? 0) + tinta.totalMl);
+    item.waktu_mulai_cetak = item.waktu_mulai_cetak ?? now;
+    item.updated_at = now;
+    const statusCetak = statusSetelahCetak(item.qty, item.qty_tercetak ?? 0);
+    if (statusCetak === 'selesai') {
+      item.waktu_selesai_cetak = now;
+      item.status_produksi = item.finishing_id ? 'antrean_finishing' : 'siap_diambil';
+      enqueueSiapDiambil(item.order_id);
+    } else {
+      item.status_produksi = 'antrean_cetak';
+    }
+    return null;
+  };
+
+  app.post('/api/operator/grup', requireAuth(['operator_cetak']), async (req, res) => {
+    const operator = getCurrentUser(req);
+    const body = req.body as { item_ids?: unknown[]; catatan?: string };
+    const itemIds = [...new Set((body.item_ids ?? [])
+      .map((id) => parsePositiveId(id))
+      .filter((id): id is number => id !== null))];
+    if (itemIds.length === 0) {
+      res.status(422).json({ error: 'Pilih minimal satu item untuk grup cetak.' });
+      return;
+    }
+    let grupId: number | null = null;
+    await store.critical(
+      ['order_items', 'cetak_grup', 'cetak_grup_item', 'audit_logs'],
+      () => {
+        const db = store.getState();
+        const items = itemIds
+          .map((id) => db.order_items.find((it) => it.id === id))
+          .filter((it): it is DbState['order_items'][number] => Boolean(it));
+        if (items.length === 0) {
+          res.status(422).json({ error: 'Item grup tidak ditemukan.' });
+          return;
+        }
+        const nonMeteran = items.find((it) => db.products.find((p) => p.id === it.product_id)?.kategori_produk !== 'meteran');
+        if (nonMeteran) {
+          res.status(422).json({ error: 'Grup cetak hanya untuk produk meteran.' });
+          return;
+        }
+        const tidakSiap = items.find(
+          (it) => !['antrean_cetak', 'siap_tata', 'proses_cetak', 'cetak_ulang'].includes(it.status_produksi),
+        );
+        if (tidakSiap) {
+          res.status(422).json({ error: `Item ${tidakSiap.nama_item ?? tidakSiap.id} tidak berada di antrean cetak.` });
+          return;
+        }
+        const sudahDigrup = items.find((it) =>
+          db.cetak_grup_item.some((gi) => gi.order_item_id === it.id && gi.status !== 'selesai'),
+        );
+        if (sudahDigrup) {
+          res.status(422).json({ error: `Item ${sudahDigrup.nama_item ?? sudahDigrup.id} masih ada di grup cetak yang belum selesai.` });
+          return;
+        }
+        const notaBatal = items.find((it) => {
+          const order = db.orders.find((o) => o.id === it.order_id);
+          return !order || !activeOrderRaw(order);
+        });
+        if (notaBatal) {
+          res.status(422).json({ error: 'Nota item sudah dibatalkan (void).' });
+          return;
+        }
+        const product = db.products.find((p) => p.id === items[0].product_id);
+        const machine = mesinUtamaCetak(db, product);
+        if (!machine) {
+          res.status(422).json({ error: 'Mesin cetak aktif belum tersedia.' });
+          return;
+        }
+        const now = new Date().toISOString();
+        const id = store.nextId('cetak_grup');
+        const grup: DbState['cetak_grup'][number] = {
+          id,
+          kode_grup: `GRP-${now.slice(0, 10).replace(/-/g, '')}-${id}`,
+          operator_id: operator.id,
+          machine_id: machine.id,
+          status: 'menunggu',
+          tanggal: now.slice(0, 10),
+          catatan: body.catatan?.trim() || null,
+          created_at: now,
+          updated_at: now,
+        };
+        db.cetak_grup.push(grup);
+        for (const it of items) {
+          db.cetak_grup_item.push({
+            id: store.nextId('cetak_grup_item'),
+            grup_id: id,
+            order_item_id: it.id,
+            qty_cetak: Math.max(1, it.qty - (it.qty_tercetak ?? 0)),
+            panjang_file_m: null,
+            lebar_file_m: null,
+            sumber_bahan: 'roll',
+            roll_id: null,
+            cattoff_id: null,
+            offcut_id: null,
+            offcut_lebar_m: null,
+            offcut_panjang_m: null,
+            masuk_wos_m2: 0,
+            status: 'menunggu',
+            catatan: null,
+            updated_at: now,
+          });
+          it.status_produksi = 'siap_tata';
+          it.ditata_at = now;
+          it.machine_id = machine.id;
+          it.operator_id = operator.id;
+          it.updated_at = now;
+        }
+        grupId = id;
+        store.persist();
+        auditRequest(req, 'operator_grup_dibuat', 'cetak_grup', id, `${operator.name} membuat grup ${grup.kode_grup} (${items.length} item).`);
+        broadcastEvent('production_updated', { orderId: items[0].order_id });
+      },
+    );
+    if (!grupId) return;
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === grupId);
+    if (!grup) {
+      res.status(500).json({ error: 'Grup cetak gagal dibuat.' });
+      return;
+    }
+    res.json({ grup: hydrateGrupCetak(db, grup) });
+  });
+
+  app.patch('/api/operator/grup/:id/item/:itemId', requireAuth(['operator_cetak']), (req, res) => {
+    const body = req.body as {
+      qty_cetak?: number;
+      panjang_file_m?: number;
+      lebar_file_m?: number;
+      sumber_bahan?: 'roll' | 'cattoff' | 'offcut';
+      roll_id?: number | null;
+      cattoff_id?: number | null;
+      offcut_id?: number | null;
+      offcut_lebar_m?: number | null;
+      offcut_panjang_m?: number | null;
+      status?: 'menunggu' | 'selesai' | 'kendala';
+      catatan?: string | null;
+    };
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === parsePositiveId(req.params.id));
+    const gi = db.cetak_grup_item.find((row) => row.id === parsePositiveId(req.params.itemId));
+    if (!grup || !gi || gi.grup_id !== grup.id) {
+      res.status(404).json({ error: 'Item grup tidak ditemukan.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    if (body.qty_cetak !== undefined) gi.qty_cetak = Math.max(1, Math.floor(Number(body.qty_cetak)));
+    if (body.panjang_file_m !== undefined) gi.panjang_file_m = Number(body.panjang_file_m) > 0 ? round2(Number(body.panjang_file_m)) : null;
+    if (body.lebar_file_m !== undefined) gi.lebar_file_m = Number(body.lebar_file_m) > 0 ? round2(Number(body.lebar_file_m)) : null;
+    if (body.sumber_bahan !== undefined && ['roll', 'cattoff', 'offcut'].includes(body.sumber_bahan)) {
+      gi.sumber_bahan = body.sumber_bahan;
+    }
+    if (body.roll_id !== undefined) gi.roll_id = body.roll_id;
+    if (body.cattoff_id !== undefined) gi.cattoff_id = body.cattoff_id;
+    if (body.offcut_id !== undefined) gi.offcut_id = body.offcut_id;
+    if (body.offcut_lebar_m !== undefined) gi.offcut_lebar_m = Number(body.offcut_lebar_m) > 0 ? round2(Number(body.offcut_lebar_m)) : null;
+    if (body.offcut_panjang_m !== undefined) gi.offcut_panjang_m = Number(body.offcut_panjang_m) > 0 ? round2(Number(body.offcut_panjang_m)) : null;
+    if (body.status !== undefined && ['menunggu', 'selesai', 'kendala'].includes(body.status)) gi.status = body.status;
+    if (body.catatan !== undefined) gi.catatan = body.catatan?.trim() || null;
+    gi.updated_at = now;
+    if (grup.status === 'menunggu') grup.status = 'dalam_proses';
+    grup.updated_at = now;
+    store.persist();
+    res.json({ grup: hydrateGrupCetak(db, grup) });
+  });
+
+  app.post('/api/operator/grup/:id/selesai-item', requireAuth(['operator_cetak']), async (req, res) => {
+    const operator = getCurrentUser(req);
+    const gid = parsePositiveId(req.params.id);
+    const body = req.body as { cetak_grup_item_id?: number; warna_tinta_ids?: number[] };
+    const giId = parsePositiveId(body.cetak_grup_item_id);
+    if (!gid || !giId) {
+      res.status(422).json({ error: 'Item grup tidak valid.' });
+      return;
+    }
+    const warnaIds = Array.isArray(body.warna_tinta_ids) ? body.warna_tinta_ids : [];
+    try {
+      await store.critical(
+        [
+          'order_items', 'material_rolls', 'material_offcuts', 'stok_cattoff',
+          'tinta_warna', 'pemakaian_tinta', 'material_logs', 'cetak_grup', 'cetak_grup_item', 'audit_logs',
+        ],
+        () => {
+          const db = store.getState();
+          const grup = db.cetak_grup.find((g) => g.id === gid);
+          const gi = db.cetak_grup_item.find((row) => row.id === giId && row.grup_id === gid);
+          if (!grup || !gi) throw new Error('HTTP422:Item grup tidak ditemukan.');
+          if (gi.status === 'selesai') throw new Error('HTTP422:Item grup sudah diselesaikan.');
+          const now = new Date().toISOString();
+          const error = prosesSelesaiGrupItem(db, grup, gi, now, operator.id, warnaIds);
+          if (error) throw new Error(`HTTP422:${error}`);
+          const tersisa = db.cetak_grup_item.some((row) => row.grup_id === gid && row.status !== 'selesai');
+          grup.status = tersisa ? 'dalam_proses' : 'selesai';
+          grup.updated_at = now;
+          store.persist();
+          auditRequest(req, 'operator_grup_item_selesai', 'cetak_grup', gid, `${operator.name} menyelesaikan ${gi.qty_cetak} cetakan item ${gi.order_item_id}.`);
+        },
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith('HTTP422:')) {
+        res.status(422).json({ error: message.slice('HTTP422:'.length) });
+        return;
+      }
+      res.status(500).json({ error: 'Gagal menyelesaikan item grup secara transaksional.' });
+      return;
+    }
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === gid);
+    res.json({ grup: grup ? hydrateGrupCetak(db, grup) : null });
+  });
+
+  app.post('/api/operator/grup/:id/selesai', requireAuth(['operator_cetak']), async (req, res) => {
+    const operator = getCurrentUser(req);
+    const gid = parsePositiveId(req.params.id);
+    if (!gid) {
+      res.status(422).json({ error: 'Grup tidak valid.' });
+      return;
+    }
+    const warnaIds = Array.isArray((req.body as { warna_tinta_ids?: unknown }).warna_tinta_ids)
+      ? (req.body as { warna_tinta_ids: unknown[] }).warna_tinta_ids
+          .map(Number)
+          .filter((id): id is number => Number.isInteger(id) && id > 0)
+      : [];
+    try {
+      await store.critical(
+        [
+          'order_items', 'material_rolls', 'material_offcuts', 'stok_cattoff',
+          'tinta_warna', 'pemakaian_tinta', 'material_logs', 'cetak_grup', 'cetak_grup_item', 'audit_logs',
+        ],
+        () => {
+          const db = store.getState();
+          const grup = db.cetak_grup.find((g) => g.id === gid);
+          if (!grup) throw new Error('HTTP422:Grup cetak tidak ditemukan.');
+          const now = new Date().toISOString();
+          const rows = db.cetak_grup_item.filter((gi) => gi.grup_id === gid && gi.status !== 'selesai');
+          if (rows.length === 0) throw new Error('HTTP422:Tidak ada item grup yang perlu diselesaikan.');
+          for (const gi of rows) {
+            const error = prosesSelesaiGrupItem(db, grup, gi, now, operator.id, warnaIds);
+            if (error) throw new Error(`HTTP422:${error}`);
+          }
+          grup.status = 'selesai';
+          grup.updated_at = now;
+          store.persist();
+          auditRequest(req, 'operator_grup_selesai', 'cetak_grup', gid, `${operator.name} menyelesaikan grup ${grup.kode_grup} (${rows.length} item).`);
+        },
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith('HTTP422:')) {
+        res.status(422).json({ error: message.slice('HTTP422:'.length) });
+        return;
+      }
+      res.status(500).json({ error: 'Gagal menyelesaikan grup secara transaksional.' });
+      return;
+    }
+    const db = store.getState();
+    const grup = db.cetak_grup.find((g) => g.id === gid);
+    res.json({ grup: grup ? hydrateGrupCetak(db, grup) : null });
+  });
+
+  app.post('/api/operator/items/:id/gagal-cetak', requireAuth(['operator_cetak']), async (req, res) => {
+    await runTransactional(
+      res,
+      () =>
+        store.critical(['order_items', 'material_rolls'], () => {
     const db = store.getState();
     const item = db.order_items.find((i) => i.id === Number(req.params.id));
-    if (!item || !['antrean_cetak', 'proses_cetak'].includes(item.status_produksi)) {
+    if (!item) {
+      res.status(404).json({ error: 'Item tidak ditemukan.' });
+      return;
+    }
+    if (item.status_produksi === 'gagal_cetak') {
+      res.status(422).json({ error: 'Item berstatus Gagal Cetak wajib dimulai cetak ulang sebelum diselesaikan.' });
+      return;
+    }
+    if (!['antrean_cetak', 'siap_tata', 'proses_cetak', 'cetak_ulang'].includes(item.status_produksi)) {
       res.status(403).json({ error: 'Item tidak berada di antrean cetak.' });
       return;
     }
@@ -2718,6 +3858,7 @@ function buildApp() {
     roll.panjang_sisa_m = sisa;
     roll.status = sisa <= 0 ? 'habis' : 'aktif';
     const luasRusak = round2(roll.lebar_m * panjangRusak);
+    const now = new Date().toISOString();
 
     db.material_logs.push({
       id: store.nextId('material_logs'),
@@ -2729,11 +3870,20 @@ function buildApp() {
       wos_potong_m2: 0,
       gagal_cetak_m2: luasRusak,
       keterangan: `Gagal cetak | Roll ${roll.kode_roll} | ${panjangRusak} m${alasan ? ` (${alasan})` : ''}`,
-      created_at: new Date().toISOString(),
+      created_at: now,
     });
+    item.status_produksi = 'gagal_cetak';
+    item.waktu_mulai_cetak = null;
+    item.waktu_selesai_cetak = null;
+    item.updated_at = now;
+    auditRequest(req, 'print_failed', 'order_item', item.id, `Gagal cetak: ${alasan || 'tanpa alasan'}. Roll ${roll.kode_roll} -${panjangRusak}m.`);
     store.persist();
     broadcastEvent('stock_updated', { orderId: item.order_id });
-    res.json({ message: 'Gagal cetak dicatat ke audit bahan tanpa mengubah tagihan pelanggan.' });
+    broadcastEvent('production_updated', { orderId: item.order_id });
+    res.json({ message: 'Gagal cetak dicatat. Item dikembalikan ke antrean cetak untuk reprint.', item: store.hydrateItem(item) });
+        }),
+      'Gagal mencatat gagal cetak secara transaksional.',
+    );
   });
 
   // --- OPERATOR: BATCH NESTING MULTI-ORDER ---
@@ -2897,54 +4047,93 @@ function buildApp() {
     res.json({ items });
   });
 
-  app.post('/api/finishing/items/:id/konfirmasi', requireAuth(['finishing']), (req, res) => {
+  app.post('/api/finishing/items/:id/qc', requireAuth(['finishing']), uploadPhoto.single('foto'), (req, res) => {
     const user = getCurrentUser(req);
     const db = store.getState();
-    const item = db.order_items.find((i) => i.id === Number(req.params.id));
+    const item = db.order_items.find((i) => i.id === parsePositiveId(req.params.id));
+    if (!item) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(404).json({ error: 'Item tidak ditemukan.' });
+      return;
+    }
+    if (!['antrean_finishing', 'proses_finishing'].includes(item.status_produksi)) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(403).json({ error: 'Item tidak berada di antrean QC finishing.' });
+      return;
+    }
+    const body = (req.body ?? {}) as { hasil?: unknown; catatan?: unknown };
+    const hasil = String(body.hasil ?? '').trim();
+    const catatan = String(body.catatan ?? '').trim();
+    const statusQc = resolveQcStatus(hasil);
+    if (!statusQc) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: 'Hasil QC wajib "lolos" atau "cacat".' });
+      return;
+    }
+    if (statusQc === 'cetak_ulang' && !catatan) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(422).json({ error: 'Catatan cacat wajib diisi untuk pengajuan cetak ulang.' });
+      return;
+    }
+    if (!req.file) {
+      res.status(422).json({ error: 'Foto bukti QC wajib diunggah.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    item.status_produksi = statusQc;
+    if (statusQc === 'cetak_ulang') {
+      item.foto_cetak_ulang = `/uploads/${req.file.filename}`;
+      item.waktu_mulai_cetak = null;
+      item.waktu_selesai_cetak = null;
+      item.machine_id = null;
+      item.operator_id = null;
+      // Cetak ulang menggantikan hasil cacat, jadi seluruh qty harus dicetak lagi.
+      item.qty_tercetak = 0;
+    }
+    item.updated_at = now;
+    auditRequest(
+      req,
+      hasil === 'cacat' ? 'finishing_qc_cacat' : 'finishing_qc_lolos',
+      'order_item',
+      item.id,
+      `QC finishing oleh ${user.name}: ${hasil}${catatan ? ` | ${catatan}` : ''}${hasil === 'cacat' ? ' | Bukti cacat tersimpan' : ''}`,
+    );
+    store.persist();
+    broadcastEvent('production_updated', { orderId: item.order_id });
+    res.json({ item: store.hydrateItem(item) });
+  });
+
+  app.post('/api/finishing/items/:id/konfirmasi', requireAuth(['finishing']), uploadPhoto.single('foto'), (req, res) => {
+    const user = getCurrentUser(req);
+    const db = store.getState();
+    const item = db.order_items.find((i) => i.id === parsePositiveId(req.params.id));
     if (!item || !['antrean_finishing', 'proses_finishing'].includes(item.status_produksi)) {
+      if (req.file) cleanupUploadedFiles([req.file]);
       res.status(403).json({ error: 'Item tidak berada di antrean finishing.' });
       return;
     }
-    const { bahan_pembantu } = (req.body ?? {}) as {
-      bahan_pembantu?: Array<{ supply_id?: number; jumlah?: number }>;
-    };
-    const usages: SupplyUsage[] = [];
-    const now = new Date().toISOString();
-    for (const row of bahan_pembantu ?? []) {
-      const supply = db.supplies.find(
-        (s) => s.id === Number(row.supply_id) && s.aktif && s.kategori === 'bahan_pembantu',
-      );
-      if (!supply) {
-        res.status(422).json({ error: 'Bahan pembantu tidak tersedia atau bukan kategori finishing.' });
-        return;
-      }
-      const jumlah = round2(Number(row.jumlah ?? 0));
-      if (!(jumlah > 0) || supply.stok + 0.001 < jumlah) {
-        res.status(422).json({ error: `Stok ${supply.nama} tidak mencukupi (${supply.stok} ${supply.satuan}).` });
-        return;
-      }
-      supply.stok = round2(supply.stok - jumlah);
-      supply.updated_at = now;
-      usages.push({
-        id: store.nextId('supply_usages'),
-        supply_id: supply.id,
-        order_item_id: item.id,
-        jumlah,
-        satuan: supply.satuan,
-        keterangan: `Finishing | ${supply.nama}`,
-        user_id: user.id,
-        created_at: now,
-      });
+    if (!req.file) {
+      res.status(422).json({ error: 'Foto bukti finishing wajib diunggah.' });
+      return;
     }
-    db.supply_usages.push(...usages);
+    const catatan = String((req.body as { catatan?: unknown }).catatan ?? '').trim();
+    const now = new Date().toISOString();
+    item.foto_finishing = `/uploads/${req.file.filename}`;
     item.finishing_user_id = user.id;
     item.status_produksi = 'siap_diambil';
     item.updated_at = now;
-    auditRequest(req, 'finishing_done', 'order_item', item.id, `Finishing diselesaikan oleh ${user.name}${usages.length ? ` dengan ${usages.length} bahan pembantu` : ''}.`);
+    auditRequest(
+      req,
+      'finishing_done',
+      'order_item',
+      item.id,
+      `Finishing diselesaikan oleh ${user.name} dengan bukti foto${catatan ? ` | ${catatan}` : ''}.`,
+    );
     store.persist();
     broadcastEvent('production_updated', { orderId: item.order_id });
     enqueueSiapDiambil(item.order_id);
-    res.json({ item: store.hydrateItem(item), bahan_pembantu: usages.map((u) => ({ ...u, supply_name: db.supplies.find((s) => s.id === u.supply_id)?.nama ?? null })) });
+    res.json({ item: store.hydrateItem(item), foto_finishing: item.foto_finishing });
   });
 
   // --- ADVERTISING WORKFLOW (STRICTLY NON-BILLING) ---
@@ -3039,11 +4228,13 @@ function buildApp() {
         return;
       }
 
-      const { nama_pengambil, no_wa_pengambil, catatan_pengecualian, tanda_tangan_pengambil } = req.body as {
+      const { nama_pengambil, no_wa_pengambil, catatan_pengecualian, tanda_tangan_pengambil, kurir_nama, resi_pengiriman } = req.body as {
         nama_pengambil?: string;
         no_wa_pengambil?: string;
         catatan_pengecualian?: string;
         tanda_tangan_pengambil?: string;
+        kurir_nama?: string;
+        resi_pengiriman?: string;
       };
       if (!nama_pengambil?.trim() || !no_wa_pengambil?.trim()) {
         res.status(422).json({ error: 'Nama pengambil dan No. WhatsApp pengambil wajib diisi.' });
@@ -3062,6 +4253,8 @@ function buildApp() {
       const now = new Date().toISOString();
       order.nama_pengambil = nama_pengambil.trim();
       order.no_wa_pengambil = no_wa_pengambil.trim();
+      order.kurir_nama = kurir_nama?.trim() || null;
+      order.resi_pengiriman = resi_pengiriman?.trim() || null;
       order.waktu_serah_terima = now;
       order.tanda_tangan_pengambil = signature;
       if (req.file) {
@@ -3087,6 +4280,7 @@ function buildApp() {
 
   // --- RIWAYAT SELESAI PER DIVISI ---
   app.get('/api/riwayat/:divisi', requireAuth(), (req, res) => {
+    const actor = getCurrentUser(req);
     const db = store.getState();
     const divisi = req.params.divisi;
     const q = String(req.query.q ?? '').trim().toLowerCase();
@@ -3103,16 +4297,7 @@ function buildApp() {
         o.items.some((i) => i.finishing_id !== null && ['siap_diambil', 'selesai'].includes(i.status_produksi)),
       );
     } else if (divisi === 'advertising') {
-      orders = orders
-        .filter((o) => o.advertising_spks.some((s) => s.status_lapangan === 'selesai'))
-        .map((o) => ({
-          ...o,
-          total_tagihan: 0,
-          jumlah_dp: 0,
-          sisa_tagihan: 0,
-          payments: [],
-          items: o.items.map((i) => ({ ...i, harga_satuan_dipakai: 0, subtotal: 0 })),
-        }));
+      orders = orders.filter((o) => o.advertising_spks.some((s) => s.status_lapangan === 'selesai'));
     }
 
     if (q) {
@@ -3122,6 +4307,17 @@ function buildApp() {
           (o.customer?.instansi ?? '').toLowerCase().includes(q) ||
           (o.customer?.nama_pelanggan ?? '').toLowerCase().includes(q),
       );
+    }
+
+    if (actor.role === 'advertising') {
+      orders = orders.map((o) => ({
+        ...o,
+        total_tagihan: 0,
+        jumlah_dp: 0,
+        sisa_tagihan: 0,
+        payments: [],
+        items: o.items.map((i) => ({ ...i, harga_satuan_dipakai: 0, subtotal: 0 })),
+      }));
     }
     res.json({ orders });
   });
@@ -3984,7 +5180,11 @@ function buildApp() {
     res.json({ purchase_order: poWithSupplier(po) });
   });
 
-  app.post('/api/owner/purchase-orders/:id/terima', requireAuth(['owner']), (req, res) => {
+  app.post('/api/owner/purchase-orders/:id/terima', requireAuth(['owner']), async (req, res) => {
+    await runTransactional(
+      res,
+      () =>
+        store.critical(['purchase_orders', 'material_rolls', 'supplies', 'products'], () => {
     const db = store.getState();
     const user = getCurrentUser(req);
     const po = db.purchase_orders.find((p) => p.id === Number(req.params.id));
@@ -4034,6 +5234,9 @@ function buildApp() {
     store.persist();
     broadcastEvent('purchasing_updated', { purchaseOrderId: po.id });
     res.json({ purchase_order: poWithSupplier(po), goods_receipt: receipt });
+        }),
+      'Gagal menerima PO secara transaksional.',
+    );
   });
 
   app.post('/api/owner/purchase-orders/:id/bayar', requireAuth(['owner']), (req, res) => {
@@ -4109,10 +5312,11 @@ function buildApp() {
     let outbox = [...db.whatsapp_outbox];
     if (status) outbox = outbox.filter((w) => w.status === status);
     outbox.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    const waConfig = getWaConfig();
     res.json({
       outbox: outbox.slice(0, 500),
-      gateway_terkonfigurasi: Boolean(WHATSAPP_WEBHOOK_URL),
-      webhook_url: WHATSAPP_WEBHOOK_URL ? WHATSAPP_WEBHOOK_URL.replace(/\/+$/, '') : null,
+      gateway_terkonfigurasi: waConfig.aktif && Boolean(waConfig.url),
+      webhook_url: waConfig.url || null,
     });
   });
 
@@ -4125,7 +5329,8 @@ function buildApp() {
     }
     row.status = 'pending';
     row.attempts = 0;
-    row.last_error = WHATSAPP_WEBHOOK_URL ? null : 'Gateway WhatsApp belum dikonfigurasi (WHATSAPP_WEBHOOK_URL).';
+    const waConfig = getWaConfig();
+    row.last_error = waConfig.aktif && waConfig.url ? null : 'Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan.';
     row.next_attempt_at = null;
     row.updated_at = new Date().toISOString();
     auditRequest(req, 'whatsapp_retry', 'whatsapp_outbox', row.id, `Pesan ${row.event} diantrekan ulang.`);
@@ -4170,7 +5375,10 @@ function buildApp() {
       items,
       instansis: semua,
       total_terdaftar: semua.length,
-      gateway_terkonfigurasi: Boolean(WHATSAPP_WEBHOOK_URL),
+      gateway_terkonfigurasi: (() => {
+        const waConfig = getWaConfig();
+        return waConfig.aktif && Boolean(waConfig.url);
+      })(),
     });
   });
 
@@ -4390,6 +5598,67 @@ function buildApp() {
       ringkasan,
       logs,
     });
+  });
+
+  app.post('/api/owner/stock-opname', requireAuth(['owner']), (req, res) => {
+    const db = store.getState();
+    const body = (req.body ?? {}) as { tipe?: string; id?: unknown; stok_fisik?: unknown; catatan?: unknown };
+    const tipe = String(body.tipe ?? '').trim();
+    const id = parsePositiveId(body.id);
+    const stokFisik = Number(body.stok_fisik);
+    const catatan = String(body.catatan ?? '').trim();
+    if (!id || !Number.isFinite(stokFisik) || stokFisik < 0) {
+      res.status(422).json({ error: 'Data stock opname tidak valid.' });
+      return;
+    }
+    if (!catatan) {
+      res.status(422).json({ error: 'Catatan stock opname wajib diisi.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    let before = 0;
+    let after = 0;
+    let label = '';
+    if (tipe === 'supply') {
+      const row = db.supplies.find((s) => s.id === id);
+      if (!row) return void res.status(404).json({ error: 'Bahan pembantu tidak ditemukan.' });
+      before = Number(row.stok ?? 0);
+      after = round2(stokFisik);
+      row.stok = after;
+      row.updated_at = now;
+      label = `supply:${row.nama}`;
+    } else if (tipe === 'roll') {
+      const row = db.material_rolls.find((r) => r.id === id);
+      if (!row) return void res.status(404).json({ error: 'Roll tidak ditemukan.' });
+      before = Number(row.panjang_sisa_m ?? 0);
+      after = round2(stokFisik);
+      row.panjang_sisa_m = after;
+      row.status = after <= 0 ? 'habis' : 'aktif';
+      label = `roll:${row.kode_roll}`;
+    } else if (tipe === 'cattoff') {
+      const row = db.stok_cattoff.find((c) => c.id === id);
+      if (!row) return void res.status(404).json({ error: 'Cattoff tidak ditemukan.' });
+      before = Number(row.panjang_sisa_m ?? 0);
+      after = round2(stokFisik);
+      row.panjang_sisa_m = after;
+      row.status = after <= 0 ? 'habis' : 'aktif';
+      row.updated_at = now;
+      label = `cattoff:${row.kode}`;
+    } else if (tipe === 'product') {
+      const row = db.products.find((p) => p.id === id);
+      if (!row) return void res.status(404).json({ error: 'Produk tidak ditemukan.' });
+      before = Number(row.stok_pcs ?? 0);
+      after = Math.max(0, Math.floor(stokFisik));
+      row.stok_pcs = after;
+      label = `product:${row.nama_produk}`;
+    } else {
+      res.status(422).json({ error: 'Tipe stock opname tidak didukung.' });
+      return;
+    }
+    auditRequest(req, 'stock_opname', tipe, id, `Stock opname ${label}: ${before} -> ${after}. ${catatan}`);
+    store.persist();
+    broadcastEvent('domain_update', { tipe, id });
+    res.json({ ok: true, tipe, id, sebelum: before, sesudah: after });
   });
 
   app.get('/api/owner/reports/profit-loss', requireAuth(['owner']), (req, res) => {
@@ -4799,6 +6068,119 @@ function buildApp() {
     res.json({ operatorStats, machineStats, lowSupplies, batches });
   });
 
+  // --- OWNER & ADMIN: SETTING WHATSAPP GATEWAY ---
+  const handleGetWhatsappSettings = (_req: Request, res: Response) => {
+    const db = store.getState();
+    if (!db.whatsapp_gateway_config) {
+      db.whatsapp_gateway_config = buildDefaultWhatsappGatewayConfig();
+      store.persist();
+    }
+    const runtime = getWaConfig();
+    res.json({
+      config: db.whatsapp_gateway_config,
+      gateway_terkonfigurasi: runtime.aktif && Boolean(runtime.url),
+      webhook_url: runtime.url || null,
+      app_url: runtime.appUrl,
+    });
+  };
+
+  const handleUpdateWhatsappSettings = (req: Request, res: Response) => {
+    const db = store.getState();
+    const body = (req.body ?? {}) as {
+      webhook_url?: unknown;
+      webhook_token?: unknown;
+      app_url?: unknown;
+      aktif?: unknown;
+    };
+    let webhookUrl: string;
+    let appUrl: string;
+    try {
+      webhookUrl = normalizeGatewayUrl(body.webhook_url, 'Webhook URL');
+      appUrl = normalizeGatewayUrl(body.app_url, 'APP URL');
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'URL tidak valid.' });
+      return;
+    }
+    const user = getCurrentUser(req);
+    const sekarang = new Date().toISOString();
+    const config: WhatsAppGatewayConfig = {
+      id: 1,
+      webhook_url: webhookUrl,
+      webhook_token: String(body.webhook_token ?? '').trim(),
+      app_url: appUrl || `http://localhost:${PORT}`,
+      aktif: body.aktif !== false,
+      updated_at: sekarang,
+      updated_by: user?.id ?? null,
+    };
+    db.whatsapp_gateway_config = config;
+    auditRequest(
+      req,
+      'whatsapp_gateway_update',
+      'settings',
+      1,
+      `Gateway WhatsApp diubah menjadi ${webhookUrl || '(kosong)'} (${config.aktif ? 'aktif' : 'nonaktif'}).`,
+    );
+    store.persist();
+    broadcastEvent('settings_updated');
+    void deliverWaOutbox();
+    res.json({
+      config,
+      gateway_terkonfigurasi: config.aktif && Boolean(config.webhook_url),
+      webhook_url: config.webhook_url || null,
+      app_url: config.app_url,
+    });
+  };
+
+  const handleTestWhatsappSettings = async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { no_wa?: unknown };
+    const noWa = normalizeWaNumber(body.no_wa);
+    if (!noWa) {
+      res.status(400).json({ error: 'Nomor WhatsApp tujuan wajib diisi.' });
+      return;
+    }
+    const waConfig = getWaConfig();
+    if (!waConfig.aktif || !waConfig.url) {
+      res.status(400).json({ error: 'Gateway WhatsApp belum dikonfigurasi atau dinonaktifkan.' });
+      return;
+    }
+    try {
+      const response = await fetch(waConfig.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(waConfig.token ? { Authorization: `Bearer ${waConfig.token}` } : {}),
+        },
+        body: JSON.stringify({
+          event: 'whatsapp_gateway_test',
+          to: noWa,
+          message: 'Uji koneksi WhatsApp Gateway Reffo PrintFlow. Pesan ini hanya untuk pengujian.',
+          link: null,
+          dedupe_key: `whatsapp_gateway_test:${noWa}:${Date.now()}`,
+        }),
+      });
+      if (!response.ok) throw new Error(`Gateway menjawab HTTP ${response.status}`);
+      auditRequest(req, 'whatsapp_gateway_test', 'settings', 1, `Uji gateway ke ${noWa} berhasil.`);
+      res.json({ ok: true, to: noWa });
+    } catch (err) {
+      auditRequest(
+        req,
+        'whatsapp_gateway_test',
+        'settings',
+        1,
+        `Uji gateway ke ${noWa} gagal: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Gagal menguji gateway.' });
+    }
+  };
+
+  app.get('/api/owner/settings/whatsapp', requireAuth(['owner']), handleGetWhatsappSettings);
+  app.put('/api/owner/settings/whatsapp', requireAuth(['owner']), handleUpdateWhatsappSettings);
+  app.post('/api/owner/settings/whatsapp/test', requireAuth(['owner']), handleTestWhatsappSettings);
+
+  app.get('/api/admin/settings/whatsapp', requireAuth(['admin', 'owner']), handleGetWhatsappSettings);
+  app.put('/api/admin/settings/whatsapp', requireAuth(['admin', 'owner']), handleUpdateWhatsappSettings);
+  app.post('/api/admin/settings/whatsapp/test', requireAuth(['admin', 'owner']), handleTestWhatsappSettings);
+
   app.get('/api/owner/kpi/insentif', requireAuth(['owner']), (req, res) => {
     const db = store.getState();
     res.json(
@@ -4897,10 +6279,83 @@ function buildApp() {
     res.status(500).json({ error: message });
   });
 
+  // Fase 4: scheduler harian - pengingat piutang/reklame & auto-clean TIFF.
+  let lastScheduledMaintenanceDate = '';
+  const runScheduledMaintenance = () => {
+    const today = new Date().toISOString().slice(0, 10);
+    if (lastScheduledMaintenanceDate === today) return;
+    lastScheduledMaintenanceDate = today;
+    try {
+      const db = store.getState();
+      const batas = Date.now() + 7 * 86_400_000;
+      let dibuatPiutang = 0;
+      for (const raw of db.orders.filter(activeOrderRaw)) {
+        const order = store.hydrateOrder(raw);
+        if (!(order.sisa_tagihan > 0)) continue;
+        const due = order.jatuh_tempo
+          ? new Date(order.jatuh_tempo).getTime()
+          : new Date(new Date(order.created_at).getTime() + 30 * 86_400_000).getTime();
+        if (due > batas) continue;
+        if (
+          enqueueWa(
+            'piutang_jatuh_tempo',
+            `piutang_jatuh_tempo:${order.id}:${today}`,
+            order.customer?.no_wa ?? '',
+            `Pengingat: Nota ${order.no_nota} memiliki sisa tagihan Rp ${order.sisa_tagihan.toLocaleString('id-ID')} dengan jatuh tempo ${order.jatuh_tempo ? order.jatuh_tempo.slice(0, 10) : '-'}.`,
+            order.id,
+            `${appBaseUrl()}/?nota=${order.no_nota}`,
+          )
+        ) {
+          dibuatPiutang += 1;
+        }
+      }
+
+      const { items } = hitungPajakReklame(db, PAJAK_REKLAME_HARI, new Date());
+      let dibuatReklame = 0;
+      for (const row of items) {
+        if (!normalizeWaNumber(row.no_wa)) continue;
+        if (
+          enqueueWa(
+            'pajak_reklame_jatuh_tempo',
+            `pajak_reklame_jatuh_tempo:${row.instansi_id}:${row.tahun}`,
+            row.no_wa,
+            `Pengingat pajak reklame: ${row.nama_instansi} memiliki masa berlaku hingga ${row.jatuh_tempo_berikutnya} (${row.hari_tersisa} hari lagi). Mohon segera perpanjang dan unggah bukti pembayaran.`,
+            null,
+            null,
+          )
+        ) {
+          dibuatReklame += 1;
+        }
+      }
+
+      const tiff = hapusTiffLama(AUTO_CLEAN_TIFF_HARI, null, false);
+      const dihapus = tiff.filter((h) => h.dihapus).length;
+      recordAudit(
+        null,
+        'scheduled_maintenance',
+        'system',
+        0,
+        `Scheduler harian ${today}: pengingat piutang ${dibuatPiutang}, reklame ${dibuatReklame}, TIFF dihapus ${dihapus}.`,
+      );
+      store.persist();
+      console.log(
+        `[scheduler] maintenance ${today}: piutang=${dibuatPiutang}, reklame=${dibuatReklame}, tiff=${dihapus}`,
+      );
+    } catch (err) {
+      console.error('[scheduler] maintenance gagal:', err instanceof Error ? err.message : err);
+    }
+  };
+  if (process.env.NODE_ENV !== 'test') {
+    runScheduledMaintenance();
+    const maintenanceTimer = setInterval(runScheduledMaintenance, 60 * 60 * 1000);
+    maintenanceTimer.unref();
+  }
+
   return app;
 }
 
 async function start() {
+  assertSecurityEnv();
   await store.init();
   const app = buildApp();
   const isProd = process.env.NODE_ENV === 'production';
@@ -4928,4 +6383,7 @@ async function start() {
   });
 }
 
-start();
+start().catch((err) => {
+  console.error('[startup] Server gagal berjalan:', err instanceof Error ? err.message : err);
+  process.exit(1);
+});

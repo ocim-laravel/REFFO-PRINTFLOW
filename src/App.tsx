@@ -1,18 +1,32 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Component,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ErrorInfo,
+  type ReactNode,
+} from 'react';
 import { Plus, RefreshCw } from 'lucide-react';
 import type {
   AdvertisingSpk,
   BootstrapPayload,
+  CetakGrup,
   Instansi,
   Order,
   PrintBatch,
   User,
 } from './types';
-import { apiFetch, getApiToken, setApiToken } from './lib/api';
+import { apiFetch, getApiToken, setApiToken, setUnauthorizedHandler } from './lib/api';
 import { ROLE_LABEL } from './lib/format';
 import { LoginView } from './components/LoginView';
 import { AppShell, getDefaultNavForRole, type NavKey } from './components/AppShell';
-import { AdminOrdersView } from './components/admin/AdminOrdersView';
+import {
+  AdminOrdersView,
+  type OrderCounts,
+  type OrderTab,
+} from './components/admin/AdminOrdersView';
 import { DesignReviewView } from './components/admin/DesignReviewView';
 import { OrderCreateModal } from './components/admin/OrderCreateModal';
 import { OrderSummaryModal } from './components/admin/OrderSummaryModal';
@@ -33,6 +47,7 @@ import { OwnerInsentifView } from './components/owner/OwnerInsentifView';
 import { OwnerProfitabilitasView } from './components/owner/OwnerProfitabilitasView';
 import { OwnerPurchasingView } from './components/owner/OwnerPurchasingView';
 import { OwnerIntegrationsView } from './components/owner/OwnerIntegrationsView';
+import { OwnerWhatsAppGatewayView } from './components/owner/OwnerWhatsAppGatewayView';
 import { AdminShiftView } from './components/admin/AdminShiftView';
 import { SelfApprovalView } from './components/SelfApprovalView';
 
@@ -46,7 +61,48 @@ function getPublicApprovalToken(): string | null {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-export default function App() {
+class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; message: string }
+> {
+  state = { hasError: false, message: '' };
+
+  static getDerivedStateFromError(error: unknown) {
+    return {
+      hasError: true,
+      message: error instanceof Error ? error.message : 'Terjadi kesalahan yang tidak terduga.',
+    };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('Application error', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-slate-100 p-6">
+          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 text-center shadow-sm">
+            <h1 className="font-display text-lg font-semibold text-slate-900">
+              Aplikasi mengalami kendala
+            </h1>
+            <p className="mt-2 text-sm text-slate-600">{this.state.message}</p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-5 rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-800 cursor-pointer"
+            >
+              Muat Ulang Aplikasi
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function AppContent() {
   const [accounts, setAccounts] = useState<User[]>([]);
   const [demoSwitchEnabled, setDemoSwitchEnabled] = useState(true);
   const [activeUser, setActiveUser] = useState<User | null>(null);
@@ -54,9 +110,12 @@ export default function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null);
 
   const [orders, setOrders] = useState<Order[]>([]);
+  const [orderTab, setOrderTab] = useState<OrderTab>('semua');
+  const [orderCounts, setOrderCounts] = useState<OrderCounts | undefined>();
   const [desainerQueue, setDesainerQueue] = useState<Order[]>([]);
   const [operatorQueue, setOperatorQueue] = useState<OperatorQueueItem[]>([]);
   const [operatorBatches, setOperatorBatches] = useState<PrintBatch[]>([]);
+  const [operatorGrup, setOperatorGrup] = useState<CetakGrup[]>([]);
   const [finishingQueue, setFinishingQueue] = useState<OperatorQueueItem[]>([]);
   const [advertisingSpks, setAdvertisingSpks] = useState<AdvertisingSpk[]>([]);
   const [serahTerimaOrders, setSerahTerimaOrders] = useState<Order[]>([]);
@@ -72,10 +131,23 @@ export default function App() {
   const [createOrderOpen, setCreateOrderOpen] = useState(false);
   const [inspectedOrder, setInspectedOrder] = useState<Order | null>(null);
   const [flash, setFlash] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [serverBadges, setServerBadges] = useState<Partial<Record<NavKey, number>>>({});
+  const [shiftAktif, setShiftAktif] = useState(false);
   const handledDeepLinkRef = useRef(false);
 
   const notify = useCallback((type: 'success' | 'error', message: string) => {
     setFlash({ type, message });
+  }, []);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setApiToken(null);
+      window.sessionStorage.removeItem(STORAGE_KEY);
+      setActiveUser(null);
+      setInspectedOrder(null);
+      setCreateOrderOpen(false);
+    });
+    return () => setUnauthorizedHandler(null);
   }, []);
 
   useEffect(() => {
@@ -111,11 +183,21 @@ export default function App() {
     if (!activeUser) return;
     setLoadingView(true);
     try {
-      await loadBootstrap();
+      const [, badgeRes] = await Promise.all([
+        loadBootstrap(),
+        apiFetch<{ badges: Partial<Record<NavKey, number>>; shift_aktif?: boolean }>('/api/badges').catch(() => null),
+      ]);
+      if (badgeRes) {
+        setServerBadges(badgeRes.badges);
+        setShiftAktif(Boolean(badgeRes.shift_aktif));
+      }
 
       if (activeNav === 'admin_orders' || activeNav === 'owner_rekap') {
-        const res = await apiFetch<{ orders: Order[] }>('/api/orders');
+        const res = await apiFetch<{ orders: Order[]; counts?: OrderCounts }>(
+          `/api/orders?tab=${orderTab}`,
+        );
         setOrders(res.orders);
+        if (res.counts) setOrderCounts(res.counts);
       } else if (activeNav === 'admin_reviews') {
         const res = await apiFetch<{ orders: Order[] }>('/api/admin/design-reviews');
         setOrders(res.orders);
@@ -123,11 +205,14 @@ export default function App() {
         const res = await apiFetch<{ orders: Order[] }>('/api/desainer/queue');
         setDesainerQueue(res.orders);
       } else if (activeNav === 'operator_queue') {
-        const res = await apiFetch<{ items: OperatorQueueItem[]; batches: PrintBatch[] }>(
-          '/api/operator/queue',
-        );
+        const res = await apiFetch<{
+          items: OperatorQueueItem[];
+          batches: PrintBatch[];
+          grup?: CetakGrup[];
+        }>('/api/operator/queue');
         setOperatorQueue(res.items);
         setOperatorBatches(res.batches ?? []);
+        setOperatorGrup(res.grup ?? []);
       } else if (activeNav === 'finishing_queue') {
         const res = await apiFetch<{ items: OperatorQueueItem[] }>('/api/finishing/queue');
         setFinishingQueue(res.items);
@@ -172,13 +257,31 @@ export default function App() {
     } finally {
       setLoadingView(false);
     }
-  }, [activeUser, activeNav, dateFilter, loadBootstrap, notify]);
+  }, [activeUser, activeNav, dateFilter, loadBootstrap, notify, orderTab]);
 
   useEffect(() => {
     if (activeUser) {
       loadActiveData();
     }
   }, [activeUser, activeNav, loadActiveData]);
+
+  useEffect(() => {
+    if (!activeUser) return;
+    const pollBadges = async () => {
+      try {
+        const res = await apiFetch<{
+          badges: Partial<Record<NavKey, number>>;
+          shift_aktif?: boolean;
+        }>('/api/badges');
+        setServerBadges(res.badges);
+        setShiftAktif(Boolean(res.shift_aktif));
+      } catch {
+        return;
+      }
+    };
+    const timer = window.setInterval(pollBadges, 30_000);
+    return () => window.clearInterval(timer);
+  }, [activeUser]);
 
   // URL Deep-Link handler for QR Code Nota (?nota=INV-... or ?orderId=...)
   useEffect(() => {
@@ -205,9 +308,7 @@ export default function App() {
   // Real-time SSE sync across open division dashboards
   useEffect(() => {
     if (!activeUser) return;
-    const token = getApiToken();
-    const url = token ? `/api/events?token=${encodeURIComponent(token)}` : '/api/events';
-    const source = new EventSource(url);
+    const source = new EventSource('/api/events', { withCredentials: true });
     let timer: number | null = null;
 
     const handleDomainUpdate = (evt: MessageEvent) => {
@@ -291,6 +392,7 @@ export default function App() {
       admin_orders: 'Daftar Nota & Order',
       admin_reviews: 'Review Desain (ACC / Revisi)',
       admin_shift: 'Shift & Tutup Kasir Harian',
+      admin_whatsapp: 'Setting WhatsApp Gateway (Admin)',
       desainer_queue: 'Antrean Desain',
       operator_queue: 'Antrean Cetak Mesin',
       finishing_queue: 'Antrean Finishing',
@@ -307,6 +409,7 @@ export default function App() {
       owner_profitabilitas: 'Analisis Profitabilitas Produk & Klien',
       owner_purchasing: 'Supplier, Purchase Order & Hutang Dagang',
       owner_integrations: 'WhatsApp, Ekspor & Pemeliharaan TIFF',
+      owner_whatsapp_gateway: 'Setting → WhatsApp Gateway',
       owner_staff: 'Manajemen Staf & Audit Log',
       owner_settings: 'Pengaturan Master',
     };
@@ -318,16 +421,23 @@ export default function App() {
 
   const badges = useMemo<Partial<Record<NavKey, number>>>(() => {
     return {
-      admin_reviews: orders.filter((o) =>
-        o.items.some((i) => i.status_produksi === 'menunggu_acc' && !i.acc_admin_id),
-      ).length,
-      desainer_queue: desainerQueue.length,
-      operator_queue: operatorQueue.length,
-      finishing_queue: finishingQueue.length,
-      advertising_spk: advertisingSpks.filter((s) => s.status_lapangan !== 'selesai').length,
-      serah_terima: serahTerimaOrders.length,
+      ...serverBadges,
+      ...(orders.length > 0
+        ? {
+            admin_reviews: orders.filter((o) =>
+              o.items.some((i) => i.status_produksi === 'menunggu_acc' && !i.acc_admin_id),
+            ).length,
+          }
+        : {}),
+      ...(activeNav === 'desainer_queue' ? { desainer_queue: desainerQueue.length } : {}),
+      ...(activeNav === 'operator_queue' ? { operator_queue: operatorQueue.length } : {}),
+      ...(activeNav === 'finishing_queue' ? { finishing_queue: finishingQueue.length } : {}),
+      ...(activeNav === 'advertising_spk'
+        ? { advertising_spk: advertisingSpks.filter((s) => s.status_lapangan !== 'selesai').length }
+        : {}),
+      ...(activeNav === 'serah_terima' ? { serah_terima: serahTerimaOrders.length } : {}),
     };
-  }, [orders, desainerQueue, operatorQueue, finishingQueue, advertisingSpks, serahTerimaOrders]);
+  }, [serverBadges, activeNav, orders, desainerQueue, operatorQueue, finishingQueue, advertisingSpks, serahTerimaOrders]);
 
   const publicApprovalToken = useMemo(() => getPublicApprovalToken(), []);
 
@@ -380,6 +490,7 @@ export default function App() {
       flash={flash}
       onDismissFlash={() => setFlash(null)}
       badges={badges}
+      shiftAktif={shiftAktif || Boolean(bootstrap?.shifts?.some((s) => s.status === 'buka'))}
       demoSwitchEnabled={demoSwitchEnabled}
     >
       {(activeNav === 'admin_orders' || activeNav === 'owner_rekap') && (
@@ -387,6 +498,9 @@ export default function App() {
           orders={orders}
           loading={loadingView}
           readOnly={activeUser.role === 'owner'}
+          tab={orderTab}
+          counts={orderCounts}
+          onTabChange={setOrderTab}
           onInspectOrder={setInspectedOrder}
           onGoToReview={() => setActiveNav('admin_reviews')}
           onOpenCreate={() => setCreateOrderOpen(true)}
@@ -403,6 +517,14 @@ export default function App() {
 
       {activeNav === 'admin_shift' && (
         <AdminShiftView onRefresh={loadActiveData} onNotify={notify} />
+      )}
+
+      {activeNav === 'admin_whatsapp' && (
+        <OwnerWhatsAppGatewayView
+          apiPrefix="/api/admin/settings/whatsapp"
+          title="Setting WhatsApp Gateway (Admin — Sementara)"
+          onNotify={notify}
+        />
       )}
 
       {activeNav === 'desainer_queue' && (
@@ -423,6 +545,9 @@ export default function App() {
           machines={bootstrap?.machines ?? []}
           supplies={bootstrap?.supplies ?? []}
           batches={operatorBatches}
+          cattoffs={bootstrap?.cattoffs ?? []}
+          tintaWarna={bootstrap?.tinta_warna ?? []}
+          grup={operatorGrup}
           loading={loadingView}
           onRefresh={loadActiveData}
           onNotify={notify}
@@ -483,6 +608,8 @@ export default function App() {
           sampai={dateFilter.sampai}
           onChangeFilter={(dari, sampai) => setDateFilter({ dari, sampai })}
           loading={loadingView}
+          onNotify={notify}
+          onRefresh={loadActiveData}
         />
       )}
 
@@ -537,6 +664,10 @@ export default function App() {
         <OwnerIntegrationsView onNotify={notify} />
       )}
 
+      {activeNav === 'owner_whatsapp_gateway' && (
+        <OwnerWhatsAppGatewayView onNotify={notify} />
+      )}
+
       {activeNav === 'owner_staff' && (
         <OwnerStaffView onNotify={notify} />
       )}
@@ -547,6 +678,8 @@ export default function App() {
           finishings={bootstrap.finishings}
           machines={bootstrap?.machines ?? []}
           supplies={bootstrap?.supplies ?? []}
+          instansis={bootstrap?.instansis ?? []}
+          taxSettings={bootstrap?.tax_settings}
           onRefreshBootstrap={loadBootstrap}
           onNotify={notify}
         />
@@ -560,6 +693,7 @@ export default function App() {
           finishings={bootstrap.finishings}
           instansis={bootstrap.instansis}
           customers={bootstrap.customers}
+          taxSettings={bootstrap.tax_settings}
           onInstansiAdded={handleInstansiAdded}
           onCreated={async (created) => {
             await loadActiveData();
@@ -581,5 +715,13 @@ export default function App() {
         onNotify={notify}
       />
     </AppShell>
+  );
+}
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <AppContent />
+    </AppErrorBoundary>
   );
 }

@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import type { MaterialLog, MaterialOffcut, MaterialRoll, Product } from '../../types';
 import { formatDesimal, formatRupiah, formatTanggal, statusBadgeStyle } from '../../lib/format';
+import { apiFetch } from '../../lib/api';
 
 export interface MaterialReportData {
   rolls: Array<MaterialRoll & { luas_sisa_m2: number; persen_sisa: number }>;
@@ -23,6 +24,8 @@ interface OwnerMaterialsViewProps {
   sampai: string;
   onChangeFilter: (dari: string, sampai: string) => void;
   loading: boolean;
+  onNotify: (type: 'success' | 'error', message: string) => void;
+  onRefresh: () => Promise<void>;
 }
 
 export const OwnerMaterialsView: React.FC<OwnerMaterialsViewProps> = ({
@@ -31,7 +34,42 @@ export const OwnerMaterialsView: React.FC<OwnerMaterialsViewProps> = ({
   sampai,
   onChangeFilter,
   loading,
+  onNotify,
+  onRefresh,
 }) => {
+  const [opnameTipe, setOpnameTipe] = useState<'roll' | 'cattoff' | 'product' | 'supply'>('roll');
+  const [opnameId, setOpnameId] = useState('');
+  const [opnameStok, setOpnameStok] = useState('');
+  const [opnameCatatan, setOpnameCatatan] = useState('');
+  const [savingOpname, setSavingOpname] = useState(false);
+
+  const opnameOptions = useMemo(() => {
+    if (!data) return [];
+    if (opnameTipe === 'roll') return data.rolls.map((r) => ({ id: r.id, label: `${r.kode_roll} · ${r.jenis_bahan}`, stok: r.panjang_sisa_m }));
+    if (opnameTipe === 'cattoff') return data.offcuts.map((c) => ({ id: c.id, label: `${c.kode_roll ?? 'Cattoff'} · ${c.jenis_bahan}`, stok: c.panjang_m }));
+    if (opnameTipe === 'product') return data.stok_pcs.map((p) => ({ id: p.id, label: p.nama_produk, stok: p.stok_pcs ?? 0 }));
+    return [];
+  }, [data, opnameTipe]);
+
+  const submitOpname = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!opnameId || !opnameCatatan.trim()) return;
+    setSavingOpname(true);
+    try {
+      await apiFetch('/api/owner/stock-opname', {
+        method: 'POST',
+        body: JSON.stringify({ tipe: opnameTipe, id: Number(opnameId), stok_fisik: Number(opnameStok), catatan: opnameCatatan.trim() }),
+      });
+      onNotify('success', 'Stock opname berhasil disimpan dan tercatat di audit log.');
+      setOpnameStok('');
+      setOpnameCatatan('');
+      await onRefresh();
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal menyimpan stock opname.');
+    } finally {
+      setSavingOpname(false);
+    }
+  };
   if (loading || !data) {
     return (
       <div className="space-y-4">
@@ -114,6 +152,27 @@ export const OwnerMaterialsView: React.FC<OwnerMaterialsViewProps> = ({
             </p>
           </div>
         </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
+        <div>
+          <h3 className="font-display text-sm font-semibold text-slate-900">Stock Opname</h3>
+          <p className="text-xs text-slate-500">Sesuaikan selisih stok fisik dan sistem. Perubahan dicatat ke audit log.</p>
+        </div>
+        <form onSubmit={submitOpname} className="grid grid-cols-1 sm:grid-cols-5 gap-2 text-xs">
+          <select value={opnameTipe} onChange={(e) => { setOpnameTipe(e.target.value as 'roll' | 'cattoff' | 'product'); setOpnameId(''); }} className="rounded-lg border border-slate-300 px-2.5 py-2">
+            <option value="roll">Roll</option>
+            <option value="cattoff">Cattoff/Offcut</option>
+            <option value="product">Produk Satuan</option>
+          </select>
+          <select value={opnameId} onChange={(e) => { setOpnameId(e.target.value); const opt = opnameOptions.find((o) => String(o.id) === e.target.value); if (opt) setOpnameStok(String(opt.stok)); }} className="rounded-lg border border-slate-300 px-2.5 py-2 sm:col-span-2">
+            <option value="">Pilih item...</option>
+            {opnameOptions.map((o) => <option key={o.id} value={o.id}>{o.label} (sistem: {o.stok})</option>)}
+          </select>
+          <input type="number" min="0" step="0.01" value={opnameStok} onChange={(e) => setOpnameStok(e.target.value)} placeholder="Stok fisik" className="rounded-lg border border-slate-300 px-2.5 py-2" required />
+          <button type="submit" disabled={savingOpname} className="rounded-lg bg-slate-900 px-3 py-2 font-semibold text-white disabled:opacity-50 cursor-pointer">{savingOpname ? 'Menyimpan...' : 'Simpan Opname'}</button>
+          <input type="text" value={opnameCatatan} onChange={(e) => setOpnameCatatan(e.target.value)} placeholder="Catatan selisih/waktu opname wajib" className="rounded-lg border border-slate-300 px-2.5 py-2 sm:col-span-5" required />
+        </form>
       </div>
 
       {/* Roll Stock & Offcuts */}
