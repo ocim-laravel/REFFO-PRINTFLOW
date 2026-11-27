@@ -152,6 +152,9 @@ export interface Supplier {
 export type PurchaseOrderStatus = 'draft' | 'dikirim' | 'diterima' | 'batal';
 export type PurchaseOrderItemKind = 'roll' | 'supply' | 'produk';
 
+/** Status pelacakan pengiriman (kurir/resi) untuk serah terima */
+export type TrackingStatus = 'belum_dikirim' | 'dikirim' | 'diterima' | 'tertangkap' | 'selesai';
+
 export interface PurchaseOrderItem {
   id: number;
   po_id?: number;
@@ -421,6 +424,14 @@ export interface AdvertisingSpk {
   lokasi_pasang: string;
   catatan_teknis: string | null;
   status_lapangan: SpkFieldStatus;
+  foto_before?: string | null;
+  foto_after?: string | null;
+  lat?: number | null;
+  lng?: number | null;
+  kurir_nama?: string | null;
+  resi_pengiriman?: string | null;
+  travel_status?: string | null;
+  travel_notes?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -492,6 +503,13 @@ export interface OrderItem {
   updated_at: string;
 }
 
+export interface TiffPreflightRule {
+  order_item_id: number;
+  file_name?: string;
+  status: 'valid' | 'warning' | 'error';
+  notes?: string;
+}
+
 export type PaymentMethod = 'Tunai' | 'Transfer' | 'QRIS';
 
 export interface OrderPayment {
@@ -549,6 +567,7 @@ export interface Order {
   no_wa_pengambil: string | null;
   kurir_nama: string | null;
   resi_pengiriman: string | null;
+  tracking_status: TrackingStatus;
   waktu_serah_terima: string | null;
   catatan_pengecualian: string | null;
   deadline: string | null;

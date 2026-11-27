@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Download, RefreshCw, Save, Wallet } from 'lucide-react';
 import type { InsentifJenis, InsentifRate, InsentifRole } from '../../types';
 import { ROLE_LABEL, formatDesimal, formatRupiah } from '../../lib/format';
-import { apiFetch, getApiToken } from '../../lib/api';
+import { apiFetch, downloadAuthorized } from '../../lib/api';
 
 interface InsentifStafRow {
   user_id: number;
@@ -115,13 +115,15 @@ export const OwnerInsentifView: React.FC<OwnerInsentifViewProps> = ({
     }
   };
 
-  const unduh = () => {
+  const unduh = async () => {
     const qs = new URLSearchParams({ type: 'insentif' });
     if (dari) qs.set('dari', dari);
     if (sampai) qs.set('sampai', sampai);
-    const token = getApiToken();
-    if (token) qs.set('token', token);
-    window.open(`/api/owner/reports/export?${qs.toString()}`, '_blank', 'noopener');
+    try {
+      await downloadAuthorized(`/api/owner/reports/export?${qs.toString()}`, 'reffo-insentif.csv');
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal mengekspor insentif.');
+    }
   };
 
   return (

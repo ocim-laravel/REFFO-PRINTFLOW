@@ -141,8 +141,8 @@ export const DesainerView: React.FC<DesainerViewProps> = ({
     const idxMatch = filename.match(/^0*(\d+)[-_.\s]/);
     if (idxMatch) {
       const idx = Number(idxMatch[1]) - 1;
-      if (idx >= 0 && idx < order.items.length && order.items[idx].acc_admin_id) {
-        return String(order.items[idx].id);
+      if (idx >= 0 && idx < order.items.length && order.items[idx]?.acc_admin_id) {
+        return String(order.items[idx]?.id ?? 0);
       }
     }
     const lower = filename.toLowerCase();

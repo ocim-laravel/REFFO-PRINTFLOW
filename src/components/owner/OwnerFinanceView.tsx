@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Download, RefreshCw, Wallet, TrendingUp, AlertTriangle } from 'lucide-react';
 import { formatRupiah, formatTanggalSingkat } from '../../lib/format';
-import { apiFetch, getApiToken } from '../../lib/api';
+import { apiFetch, downloadAuthorized } from '../../lib/api';
 
 export interface FinanceData {
   dari: string | null;
@@ -127,15 +127,17 @@ export const OwnerFinanceView: React.FC<OwnerFinanceViewProps> = ({
     load();
   }, [load]);
 
-  const handleExport = (
+  const handleExport = async (
     type: 'orders' | 'payments' | 'piutang' | 'hutang' | 'po' | 'supplier' | 'audit' | 'production' | 'stock',
   ) => {
     const qs = new URLSearchParams({ type });
     if (dari) qs.set('dari', dari);
     if (sampai) qs.set('sampai', sampai);
-    const token = getApiToken();
-    if (token) qs.set('token', token);
-    window.open(`/api/owner/reports/export?${qs.toString()}`, '_blank', 'noopener');
+    try {
+      await downloadAuthorized(`/api/owner/reports/export?${qs.toString()}`, `reffo-${type}.csv`);
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal mengekspor laporan.');
+    }
   };
 
   const summaryCards = data

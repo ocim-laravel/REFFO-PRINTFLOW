@@ -10,24 +10,37 @@ import {
   statusBadgeStyle,
 } from '../../lib/format';
 
+export interface OrderCounts {
+  semua: number;
+  produksi: number;
+  siap_diambil: number;
+  selesai: number;
+  batal: number;
+  piutang: number;
+}
+
+export type OrderTab = keyof OrderCounts;
+
 interface AdminOrdersViewProps {
   orders: Order[];
   loading: boolean;
   readOnly?: boolean;
+  tab: OrderTab;
+  counts?: OrderCounts;
+  onTabChange: (tab: OrderTab) => void;
   onInspectOrder: (order: Order) => void;
   onGoToReview: () => void;
   onOpenCreate: () => void;
 }
 
-type OrderTab = 'semua' | 'produksi' | 'siap_diambil' | 'selesai';
-
 function orderSummaryStatus(order: Order): { label: string; key: string } {
   if (order.items.length === 0) return { label: 'Kosong', key: 'menunggu_desain' };
   const unique = Array.from(new Set(order.items.map((i) => i.status_produksi)));
-  if (unique.length === 1) {
-    return { label: STATUS_PRODUKSI_LABEL[unique[0]], key: unique[0] };
+  const first = unique[0];
+  if (first !== undefined) {
+    return { label: STATUS_PRODUKSI_LABEL[first], key: first };
   }
-  return { label: `Beragam (${unique.length} tahap)`, key: unique[0] };
+  return { label: 'Kosong', key: 'menunggu_desain' };
 }
 
 function isSiapDiambil(order: Order): boolean {
@@ -46,29 +59,46 @@ export const AdminOrdersView: React.FC<AdminOrdersViewProps> = ({
   orders,
   loading,
   readOnly = false,
+  tab,
+  counts: countsProp,
+  onTabChange,
   onInspectOrder,
   onGoToReview,
   onOpenCreate,
 }) => {
-  const [tab, setTab] = useState<OrderTab>('semua');
   const [query, setQuery] = useState('');
 
-  const counts = useMemo(() => {
-    const siap = orders.filter(isSiapDiambil).length;
-    const selesai = orders.filter(isSelesai).length;
-    const produksi = orders.length - siap - selesai;
-    const menungguAcc = orders.filter((o) =>
+  const localCounts = useMemo(() => {
+    const aktif = orders.filter((o) => o.status_nota !== 'batal');
+    const siap = aktif.filter(isSiapDiambil).length;
+    const selesai = aktif.filter(isSelesai).length;
+    const menungguAcc = aktif.filter((o) =>
       o.items.some((i) => i.status_produksi === 'menunggu_acc' && !i.acc_admin_id),
     ).length;
-    return { total: orders.length, produksi, siap, selesai, menungguAcc };
+    return {
+      semua: aktif.length,
+      produksi: aktif.filter((o) => !isSiapDiambil(o) && !isSelesai(o)).length,
+      siap_diambil: siap,
+      selesai,
+      batal: orders.length - aktif.length,
+      piutang: aktif.filter((o) => o.sisa_tagihan > 0).length,
+      menungguAcc,
+    };
   }, [orders]);
+
+  const counts = countsProp
+    ? { ...countsProp, menungguAcc: localCounts.menungguAcc }
+    : localCounts;
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return orders.filter((o) => {
+      if (tab === 'batal' && o.status_nota !== 'batal') return false;
+      if (tab !== 'batal' && o.status_nota === 'batal') return false;
       if (tab === 'siap_diambil' && !isSiapDiambil(o)) return false;
       if (tab === 'selesai' && !isSelesai(o)) return false;
       if (tab === 'produksi' && (isSiapDiambil(o) || isSelesai(o))) return false;
+      if (tab === 'piutang' && o.sisa_tagihan <= 0) return false;
       if (!q) return true;
       return (
         o.no_nota.toLowerCase().includes(q) ||
@@ -85,7 +115,7 @@ export const AdminOrdersView: React.FC<AdminOrdersViewProps> = ({
         <div className="bg-white rounded-xl border border-slate-200 p-4">
           <p className="text-xs font-medium text-slate-500">Total Nota Aktif</p>
           <p className="mt-1 font-mono tabular-nums text-2xl font-bold text-slate-900">
-            {counts.total}
+            {counts.semua}
           </p>
         </div>
         <div className="bg-white rounded-xl border border-slate-200 p-4">
@@ -100,7 +130,7 @@ export const AdminOrdersView: React.FC<AdminOrdersViewProps> = ({
             <p className="font-mono tabular-nums text-2xl font-bold text-amber-700">
               {counts.menungguAcc}
             </p>
-            {counts.menungguAcc > 0 && (
+            {!readOnly && counts.menungguAcc > 0 && (
               <button
                 type="button"
                 onClick={onGoToReview}
@@ -115,7 +145,7 @@ export const AdminOrdersView: React.FC<AdminOrdersViewProps> = ({
         <div className="bg-white rounded-xl border border-slate-200 p-4">
           <p className="text-xs font-medium text-slate-500">Siap Diambil Pelanggan</p>
           <p className="mt-1 font-mono tabular-nums text-2xl font-bold text-emerald-700">
-            {counts.siap}
+            {counts.siap_diambil}
           </p>
         </div>
       </div>
@@ -126,16 +156,18 @@ export const AdminOrdersView: React.FC<AdminOrdersViewProps> = ({
           <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto">
             {(
               [
-                { key: 'semua', label: `Semua (${counts.total})` },
+                { key: 'semua', label: `Semua (${counts.semua})` },
                 { key: 'produksi', label: `Produksi (${counts.produksi})` },
-                { key: 'siap_diambil', label: `Siap Diambil (${counts.siap})` },
+                { key: 'siap_diambil', label: `Siap Diambil (${counts.siap_diambil})` },
                 { key: 'selesai', label: `Selesai (${counts.selesai})` },
+                { key: 'batal', label: `Batal (${counts.batal})` },
+                { key: 'piutang', label: `Piutang (${counts.piutang})` },
               ] as const
             ).map((t) => (
               <button
                 key={t.key}
                 type="button"
-                onClick={() => setTab(t.key)}
+                onClick={() => onTabChange(t.key)}
                 className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   tab === t.key
                     ? 'bg-white text-slate-900 shadow-xs'

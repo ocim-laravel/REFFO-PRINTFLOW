@@ -116,8 +116,10 @@ export const DesignReviewView: React.FC<DesignReviewViewProps> = ({
                     )}`}
                   >
                     {alreadyApproved
-                      ? 'Sudah ACC (Menunggu TIFF)'
-                      : STATUS_PRODUKSI_LABEL[order.items[0]?.status_produksi ?? 'menunggu_acc']}
+                      ? 'Sudah ACC Admin (Menunggu TIFF)'
+                      : order.approval_status === 'disetujui'
+                        ? 'Disetujui Pelanggan (Menunggu ACC Admin)'
+                        : STATUS_PRODUKSI_LABEL[order.items[0]?.status_produksi ?? 'menunggu_acc']}
                   </span>
                 </div>
 
@@ -148,10 +150,12 @@ export const DesignReviewView: React.FC<DesignReviewViewProps> = ({
                   <div className="space-y-1.5">
                     <p className="text-xs font-semibold text-slate-700">Catatan Revisi Terakhir:</p>
                     <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
-                      <span className="font-semibold">Revisi #{order.design_revisions[0].revisi_ke}:</span>{' '}
-                      {order.design_revisions[0].catatan_revisi}
+                      <span className="font-semibold">
+                        Revisi #{order.design_revisions[0]!.revisi_ke}:
+                      </span>{' '}
+                      {order.design_revisions[0]?.catatan_revisi}
                       <span className="block text-[11px] text-slate-500 mt-0.5">
-                        {formatTanggal(order.design_revisions[0].created_at)}
+                        {formatTanggal(order.design_revisions[0]?.created_at)}
                       </span>
                     </div>
                   </div>

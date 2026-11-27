@@ -1,12 +1,92 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
-import type { InsentifRate } from '../src/types.ts';
+import type { InsentifRate, TaxPriceMode, TaxSettings, WhatsAppGatewayConfig } from '../src/types.ts';
 import type { DatabaseState } from './store.ts';
+
+/** Tabel yang disinkronkan per baris (CRUD), bukan snapshot penuh. */
+export type SyncTable =
+  | 'users'
+  | 'instansis'
+  | 'customers'
+  | 'products'
+  | 'finishings'
+  | 'material_rolls'
+  | 'material_offcuts'
+  | 'print_machines'
+  | 'supplies'
+  | 'supply_usages'
+  | 'print_batches'
+  | 'stok_cattoff'
+  | 'tinta_warna'
+  | 'cetak_grup'
+  | 'cetak_grup_item'
+  | 'pemakaian_tinta'
+  | 'orders'
+  | 'order_items'
+  | 'order_payments'
+  | 'design_revisions'
+  | 'advertising_spks'
+  | 'material_logs'
+  | 'operational_expenses'
+  | 'shifts'
+  | 'suppliers'
+  | 'purchase_orders'
+  | 'goods_receipts'
+  | 'supplier_payments'
+  | 'whatsapp_outbox'
+  | 'whatsapp_gateway_config'
+  | 'tax_settings'
+  | 'insentif_rates'
+  | 'audit_logs';
+
+/** Urutan parent -> child untuk insert/update; delete memakai urutan terbalik. */
+export const SYNC_TABLES: SyncTable[] = [
+  'users',
+  'instansis',
+  'customers',
+  'products',
+  'finishings',
+  'material_rolls',
+  'material_offcuts',
+  'print_machines',
+  'supplies',
+  'stok_cattoff',
+  'tinta_warna',
+  'shifts',
+  'suppliers',
+  'orders',
+  'order_items',
+  'cetak_grup',
+  'cetak_grup_item',
+  'pemakaian_tinta',
+  'supply_usages',
+  'print_batches',
+  'order_payments',
+  'design_revisions',
+  'advertising_spks',
+  'material_logs',
+  'operational_expenses',
+  'purchase_orders',
+  'goods_receipts',
+  'supplier_payments',
+  'whatsapp_outbox',
+  'whatsapp_gateway_config',
+  'tax_settings',
+  'insentif_rates',
+  'audit_logs',
+];
+
+function cloneState(state: DatabaseState): DatabaseState {
+  return JSON.parse(JSON.stringify(state)) as DatabaseState;
+}
 
 export class MySqlAdapter {
   private pool: Pool | null = null;
   private syncQueue: Promise<void> = Promise.resolve();
+  private lastPersisted: DatabaseState | null = null;
+  private tableColumns = new Map<string, string[]>();
+  private tableColumnsLoaded = false;
 
   public isEnabled(): boolean {
     return (process.env.DB_DRIVER ?? 'json').toLowerCase() === 'mysql';
@@ -22,7 +102,7 @@ export class MySqlAdapter {
     };
   }
 
-  public async initialize(seedState: DatabaseState): Promise<DatabaseState> {
+  public async initialize(createSeed: () => DatabaseState): Promise<DatabaseState> {
     const cfg = this.getConfig();
     const bootstrapConn = await mysql.createConnection({
       host: cfg.host,
@@ -54,24 +134,43 @@ export class MySqlAdapter {
     });
 
     await this.migrateSchema();
+    await this.loadTableColumns();
 
     const [userRows] = await this.pool.query<RowDataPacket[]>('SELECT COUNT(*) AS cnt FROM users');
     const count = Number(userRows[0]?.cnt ?? 0);
     if (count === 0) {
+      // Snapshot penuh hanya dipakai sekali saat database benar-benar kosong.
+      const seedState = createSeed();
       await this.writeSnapshot(seedState);
+      this.lastPersisted = cloneState(seedState);
       return seedState;
     }
 
-    return await this.loadSnapshot();
+    const loaded = await this.loadSnapshot();
+    this.lastPersisted = cloneState(loaded);
+    return loaded;
   }
 
   public queuePersist(state: DatabaseState): void {
     if (!this.pool) return;
-    const cloned: DatabaseState = JSON.parse(JSON.stringify(state));
+    const cloned = cloneState(state);
     this.syncQueue = this.syncQueue
-      .then(() => this.writeSnapshot(cloned))
+      .then(async () => {
+        const conn = await this.pool!.getConnection();
+        try {
+          await conn.beginTransaction();
+          await this.persistDiff(conn, cloned);
+          await conn.commit();
+          this.lastPersisted = cloned;
+        } catch (err) {
+          await conn.rollback();
+          throw err;
+        } finally {
+          conn.release();
+        }
+      })
       .catch((err) => {
-        console.error('Gagal sinkronisasi ke MySQL:', err);
+        console.error('Gagal sinkronisasi CRUD ke MySQL:', err);
       });
   }
 
@@ -129,7 +228,15 @@ export class MySqlAdapter {
       },
       { table: 'order_items', column: 'klik_per_lembar', ddl: 'INT NOT NULL DEFAULT 1' },
       { table: 'order_items', column: 'ukuran_lembar', ddl: 'VARCHAR(80) NULL' },
+      { table: 'order_items', column: 'ditata_at', ddl: 'VARCHAR(40) NULL' },
+      { table: 'order_items', column: 'qty_tercetak', ddl: 'INT NOT NULL DEFAULT 0' },
+      { table: 'order_items', column: 'acc_pelanggan_at', ddl: 'VARCHAR(40) NULL' },
+      { table: 'order_items', column: 'acc_pelanggan_nama', ddl: 'VARCHAR(150) NULL' },
+      { table: 'order_items', column: 'acc_pelanggan_id', ddl: 'INT NULL' },
+      { table: 'order_items', column: 'foto_finishing', ddl: 'VARCHAR(255) NULL' },
+      { table: 'order_items', column: 'foto_cetak_ulang', ddl: 'VARCHAR(255) NULL' },
       { table: 'order_payments', column: 'shift_id', ddl: 'INT NULL' },
+      { table: 'whatsapp_outbox', column: 'media_path', ddl: 'VARCHAR(255) NULL' },
     ];
 
     for (const item of columns) {
@@ -140,6 +247,27 @@ export class MySqlAdapter {
       );
       if (Number(rows[0]?.cnt ?? 0) === 0) {
         await this.pool.query(`ALTER TABLE \`${item.table}\` ADD COLUMN \`${item.column}\` ${item.ddl}`);
+      }
+    }
+
+    // Enum migrations: MySQL ENUM needs MODIFY COLUMN to add new values.
+    const enumMigrations: Array<{ table: string; column: string; ddl: string; marker: string }> = [
+      {
+        table: 'order_items',
+        column: 'status_produksi',
+        ddl: "ENUM('menunggu_desain','proses_desain','menunggu_acc','revisi','antrean_cetak','siap_tata','proses_cetak','gagal_cetak','cetak_ulang','antrean_finishing','proses_finishing','siap_diambil','selesai','dibatalkan') NOT NULL DEFAULT 'menunggu_desain'",
+        marker: "'cetak_ulang'",
+      },
+    ];
+    for (const m of enumMigrations) {
+      const [rows] = await this.pool.query<RowDataPacket[]>(
+        `SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+        [m.table, m.column],
+      );
+      const columnType = String(rows[0]?.COLUMN_TYPE ?? '');
+      if (columnType && !columnType.includes(m.marker)) {
+        await this.pool.query(`ALTER TABLE \`${m.table}\` MODIFY COLUMN \`${m.column}\` ${m.ddl}`);
       }
     }
 
@@ -223,6 +351,117 @@ export class MySqlAdapter {
           UNIQUE KEY uq_insentif_role_jenis (role, jenis)
         )`,
       },
+      {
+        name: 'whatsapp_gateway_config',
+        ddl: `CREATE TABLE IF NOT EXISTS \`whatsapp_gateway_config\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          webhook_url VARCHAR(500) NOT NULL DEFAULT '',
+          webhook_token VARCHAR(500) NOT NULL DEFAULT '',
+          app_url VARCHAR(500) NOT NULL DEFAULT '',
+          aktif TINYINT(1) NOT NULL DEFAULT 0,
+          updated_at VARCHAR(40) NULL,
+          updated_by INT NULL
+        )`,
+      },
+      {
+        name: 'tax_settings',
+        ddl: `CREATE TABLE IF NOT EXISTS \`tax_settings\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          ppn_persen_default DECIMAL(5,2) NOT NULL DEFAULT 11,
+          pph23_persen_default DECIMAL(5,2) NOT NULL DEFAULT 2,
+          mode_harga ENUM('belum_termasuk_ppn','sudah_termasuk_ppn') NOT NULL DEFAULT 'belum_termasuk_ppn',
+          ppn_termasuk_diskon TINYINT(1) NOT NULL DEFAULT 1,
+          potong_pph23_otomatis TINYINT(1) NOT NULL DEFAULT 0,
+          updated_at VARCHAR(40) NULL,
+          updated_by INT NULL
+        )`,
+      },
+      {
+        name: 'stok_cattoff',
+        ddl: `CREATE TABLE IF NOT EXISTS \`stok_cattoff\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          kode VARCHAR(50) NOT NULL UNIQUE,
+          jenis_bahan VARCHAR(80) NOT NULL,
+          lebar_m DECIMAL(5,2) NOT NULL,
+          panjang_awal_m DECIMAL(8,2) NOT NULL,
+          panjang_sisa_m DECIMAL(8,2) NOT NULL,
+          status ENUM('aktif','habis') NOT NULL DEFAULT 'aktif',
+          created_at VARCHAR(40) NOT NULL,
+          updated_at VARCHAR(40) NOT NULL
+        )`,
+      },
+      {
+        name: 'tinta_warna',
+        ddl: `CREATE TABLE IF NOT EXISTS \`tinta_warna\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          kode VARCHAR(30) NOT NULL UNIQUE,
+          warna VARCHAR(50) NOT NULL,
+          satuan VARCHAR(20) NOT NULL DEFAULT 'ml',
+          stok_ml DECIMAL(12,2) NOT NULL DEFAULT 0,
+          stok_minimum_ml DECIMAL(12,2) NOT NULL DEFAULT 1000,
+          kapasitas_galon_ml DECIMAL(12,2) NOT NULL DEFAULT 5000,
+          roll_per_galon INT NOT NULL DEFAULT 6,
+          luas_per_roll_m2 DECIMAL(8,2) NOT NULL DEFAULT 224,
+          konsumsi_ml_per_m2 DECIMAL(8,2) NOT NULL DEFAULT 3.72,
+          aktif TINYINT(1) NOT NULL DEFAULT 1,
+          created_at VARCHAR(40) NOT NULL,
+          updated_at VARCHAR(40) NOT NULL
+        )`,
+      },
+      {
+        name: 'cetak_grup',
+        ddl: `CREATE TABLE IF NOT EXISTS \`cetak_grup\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          kode_grup VARCHAR(40) NOT NULL UNIQUE,
+          operator_id INT NOT NULL,
+          machine_id INT NOT NULL,
+          status ENUM('menunggu','dalam_proses','selesai','batal') NOT NULL DEFAULT 'menunggu',
+          tanggal VARCHAR(40) NOT NULL,
+          catatan TEXT NULL,
+          created_at VARCHAR(40) NOT NULL,
+          updated_at VARCHAR(40) NOT NULL,
+          FOREIGN KEY (operator_id) REFERENCES users(id),
+          FOREIGN KEY (machine_id) REFERENCES print_machines(id)
+        )`,
+      },
+      {
+        name: 'cetak_grup_item',
+        ddl: `CREATE TABLE IF NOT EXISTS \`cetak_grup_item\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          grup_id INT NOT NULL,
+          order_item_id INT NOT NULL,
+          qty_cetak INT NOT NULL,
+          panjang_file_m DECIMAL(8,2) NULL,
+          lebar_file_m DECIMAL(8,2) NULL,
+          sumber_bahan ENUM('roll','cattoff','offcut') NOT NULL DEFAULT 'roll',
+          roll_id INT NULL,
+          cattoff_id INT NULL,
+          offcut_id INT NULL,
+          offcut_lebar_m DECIMAL(5,2) NULL,
+          offcut_panjang_m DECIMAL(8,2) NULL,
+          masuk_wos_m2 DECIMAL(10,2) NOT NULL DEFAULT 0,
+          status ENUM('menunggu','selesai','kendala') NOT NULL DEFAULT 'menunggu',
+          catatan TEXT NULL,
+          updated_at VARCHAR(40) NOT NULL,
+          FOREIGN KEY (grup_id) REFERENCES cetak_grup(id) ON DELETE CASCADE,
+          FOREIGN KEY (order_item_id) REFERENCES order_items(id) ON DELETE CASCADE
+        )`,
+      },
+      {
+        name: 'pemakaian_tinta',
+        ddl: `CREATE TABLE IF NOT EXISTS \`pemakaian_tinta\` (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          order_item_id INT NOT NULL,
+          grup_id INT NULL,
+          tinta_warna_id INT NOT NULL,
+          warna VARCHAR(50) NOT NULL,
+          jumlah_ml DECIMAL(10,2) NOT NULL,
+          luas_cetak_m2 DECIMAL(10,2) NOT NULL,
+          created_at VARCHAR(40) NOT NULL,
+          FOREIGN KEY (order_item_id) REFERENCES order_items(id) ON DELETE CASCADE,
+          FOREIGN KEY (tinta_warna_id) REFERENCES tinta_warna(id)
+        )`,
+      },
     ];
     for (const table of tables) {
       await this.pool.query(table.ddl);
@@ -286,6 +525,193 @@ export class MySqlAdapter {
     return rows[0] ?? null;
   }
 
+  /** Lock seluruh baris tabel kecil (roll, tinta, produk) selama transaksi. */
+  public async lockTable(conn: PoolConnection, table: SyncTable): Promise<void> {
+    await conn.query(`SELECT id FROM \`${table}\` FOR UPDATE`);
+  }
+
+  /**
+   * Jalankan mutasi kritis di dalam satu transaksi MySQL:
+   * lock baris -> mutasi state di memori -> tulis diff CRUD -> commit.
+   * Semua persist lain diantrekan lewat syncQueue yang sama agar tidak ada
+   * snapshot lama yang menimpa hasil transaksi.
+   */
+  public async runLocked<T>(
+    getState: () => DatabaseState,
+    lockTables: SyncTable[],
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    if (!this.pool) return fn();
+
+    const task = this.syncQueue.then(async () => {
+      const conn = await this.pool!.getConnection();
+      try {
+        await conn.beginTransaction();
+        for (const table of lockTables) {
+          await this.lockTable(conn, table);
+        }
+        const result = await fn();
+        const state = getState();
+        await this.persistDiff(conn, state);
+        this.lastPersisted = cloneState(state);
+        await conn.commit();
+        return result;
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    });
+
+    this.syncQueue = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    return task;
+  }
+
+  private async loadTableColumns(): Promise<void> {
+    if (!this.pool || this.tableColumnsLoaded) return;
+    for (const table of SYNC_TABLES) {
+      const [rows] = await this.pool.query<RowDataPacket[]>(
+        `SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`,
+        [table],
+      );
+      this.tableColumns.set(
+        table,
+        rows.map((row) => String(row.name)),
+      );
+    }
+    this.tableColumnsLoaded = true;
+  }
+
+  private valueForColumn(row: Record<string, unknown>, column: string): unknown {
+    if (column === 'items_json') {
+      return JSON.stringify(row.items ?? []);
+    }
+    if (column === 'item_ids') {
+      return JSON.stringify(row.item_ids ?? []);
+    }
+    const value = row[column];
+    if (value === undefined || value === null) return null;
+    if (typeof value === 'boolean') return value ? 1 : 0;
+    if (typeof value === 'object') return JSON.stringify(value);
+    return value;
+  }
+
+  private rowHasColumn(row: Record<string, unknown>, column: string): boolean {
+    if (column === 'items_json') return true;
+    if (column === 'item_ids') return true;
+    return Object.prototype.hasOwnProperty.call(row, column);
+  }
+
+  private rowChanged(
+    old: Record<string, unknown>,
+    next: Record<string, unknown>,
+    columns: string[],
+  ): boolean {
+    for (const column of columns) {
+      if (column === 'id') continue;
+      if (!this.rowHasColumn(next, column)) continue;
+      if (
+        JSON.stringify(this.valueForColumn(old, column)) !==
+        JSON.stringify(this.valueForColumn(next, column))
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Ganti writeSnapshot() DELETE + INSERT seluruh tabel dengan CRUD per baris.
+   * Hanya baris baru / berubah / terhapus yang disentuh.
+   */
+  private async persistDiff(conn: PoolConnection, state: DatabaseState): Promise<void> {
+    await this.loadTableColumns();
+    const previous = this.lastPersisted;
+
+    const rowsFor = (table: SyncTable): Array<Record<string, unknown>> => {
+      if (table === 'whatsapp_gateway_config') {
+        return state.whatsapp_gateway_config
+          ? [state.whatsapp_gateway_config as unknown as Record<string, unknown>]
+          : [];
+      }
+      if (table === 'tax_settings') {
+        return state.tax_settings
+          ? [state.tax_settings as unknown as Record<string, unknown>]
+          : [];
+      }
+      if (table === 'print_machines') {
+        return state.machines as unknown as Array<Record<string, unknown>>;
+      }
+      return (state[table] as unknown as Array<Record<string, unknown>>) ?? [];
+    };
+    const previousRowsFor = (table: SyncTable): Array<Record<string, unknown>> => {
+      if (!previous) return [];
+      if (table === 'whatsapp_gateway_config') {
+        return previous.whatsapp_gateway_config
+          ? [previous.whatsapp_gateway_config as unknown as Record<string, unknown>]
+          : [];
+      }
+      if (table === 'tax_settings') {
+        return previous.tax_settings
+          ? [previous.tax_settings as unknown as Record<string, unknown>]
+          : [];
+      }
+      if (table === 'print_machines') {
+        return previous.machines as unknown as Array<Record<string, unknown>>;
+      }
+      return (previous[table] as unknown as Array<Record<string, unknown>>) ?? [];
+    };
+
+    // Insert/update dari parent ke child supaya foreign key aman.
+    for (const table of SYNC_TABLES) {
+      const columns = this.tableColumns.get(table) ?? [];
+      if (columns.length === 0) continue;
+      const oldRows = previousRowsFor(table);
+      const newRows = rowsFor(table);
+      const oldById = new Map(oldRows.map((row) => [Number(row.id), row]));
+
+      for (const row of newRows) {
+        const id = Number(row.id);
+        const old = oldById.get(id);
+        if (!old) {
+          const insertColumns = columns.filter((column) => this.rowHasColumn(row, column));
+          const placeholders = insertColumns.map(() => '?').join(', ');
+          await conn.query(
+            `INSERT INTO \`${table}\` (${insertColumns.map((c) => `\`${c}\``).join(', ')}) VALUES (${placeholders})`,
+            insertColumns.map((column) => this.valueForColumn(row, column)),
+          );
+        } else if (this.rowChanged(old, row, columns)) {
+          const updateColumns = columns.filter(
+            (column) => column !== 'id' && this.rowHasColumn(row, column),
+          );
+          if (updateColumns.length === 0) continue;
+          await conn.query(
+            `UPDATE \`${table}\` SET ${updateColumns.map((c) => `\`${c}\` = ?`).join(', ')} WHERE id = ?`,
+            [...updateColumns.map((column) => this.valueForColumn(row, column)), id],
+          );
+        }
+      }
+    }
+
+    // Delete dari child ke parent (urutan terbalik).
+    for (const table of [...SYNC_TABLES].reverse()) {
+      const oldRows = previousRowsFor(table);
+      const newRows = rowsFor(table);
+      const newIds = new Set(newRows.map((row) => Number(row.id)));
+      for (const old of oldRows) {
+        const id = Number(old.id);
+        if (!newIds.has(id)) {
+          await conn.query(`DELETE FROM \`${table}\` WHERE id = ?`, [id]);
+        }
+      }
+    }
+  }
+
   private async loadSnapshot(): Promise<DatabaseState> {
     if (!this.pool) throw new Error('MySQL pool belum terinisialisasi.');
 
@@ -300,6 +726,11 @@ export class MySqlAdapter {
     const [supplies] = await this.pool.query<RowDataPacket[]>('SELECT * FROM supplies ORDER BY id');
     const [supply_usages] = await this.pool.query<RowDataPacket[]>('SELECT * FROM supply_usages ORDER BY id');
     const [print_batches] = await this.pool.query<RowDataPacket[]>('SELECT * FROM print_batches ORDER BY id');
+    const [stok_cattoff] = await this.pool.query<RowDataPacket[]>('SELECT * FROM stok_cattoff ORDER BY id');
+    const [tinta_warna] = await this.pool.query<RowDataPacket[]>('SELECT * FROM tinta_warna ORDER BY id');
+    const [cetak_grup] = await this.pool.query<RowDataPacket[]>('SELECT * FROM cetak_grup ORDER BY id');
+    const [cetak_grup_item] = await this.pool.query<RowDataPacket[]>('SELECT * FROM cetak_grup_item ORDER BY id');
+    const [pemakaian_tinta] = await this.pool.query<RowDataPacket[]>('SELECT * FROM pemakaian_tinta ORDER BY id');
     const [orders] = await this.pool.query<RowDataPacket[]>('SELECT * FROM orders ORDER BY id');
     const [order_items] = await this.pool.query<RowDataPacket[]>('SELECT * FROM order_items ORDER BY id');
     const [order_payments] = await this.pool.query<RowDataPacket[]>('SELECT * FROM order_payments ORDER BY id');
@@ -314,6 +745,8 @@ export class MySqlAdapter {
     const [goods_receipts] = await this.pool.query<RowDataPacket[]>('SELECT * FROM goods_receipts ORDER BY id');
     const [supplier_payments] = await this.pool.query<RowDataPacket[]>('SELECT * FROM supplier_payments ORDER BY id');
     const [whatsapp_outbox] = await this.pool.query<RowDataPacket[]>('SELECT * FROM whatsapp_outbox ORDER BY id');
+    const [whatsapp_gateway_config] = await this.pool.query<RowDataPacket[]>('SELECT * FROM whatsapp_gateway_config ORDER BY id LIMIT 1');
+    const [tax_settings] = await this.pool.query<RowDataPacket[]>('SELECT * FROM tax_settings ORDER BY id LIMIT 1');
     const [insentif_rates] = await this.pool.query<RowDataPacket[]>('SELECT * FROM insentif_rates ORDER BY id');
 
     const maxId = (rows: RowDataPacket[]) => rows.reduce((m, r) => Math.max(m, Number(r.id) || 0), 0);
@@ -396,6 +829,49 @@ export class MySqlAdapter {
         luas_terpakai_m2: Number(b.luas_terpakai_m2 ?? 0),
         luas_waste_m2: Number(b.luas_waste_m2 ?? 0),
       })) as DatabaseState['print_batches'],
+      stok_cattoff: stok_cattoff.map((s) => ({
+        ...s,
+        lebar_m: Number(s.lebar_m),
+        panjang_awal_m: Number(s.panjang_awal_m),
+        panjang_sisa_m: Number(s.panjang_sisa_m),
+      })) as DatabaseState['stok_cattoff'],
+      tinta_warna: tinta_warna.map((w) => ({
+        ...w,
+        stok_ml: Number(w.stok_ml ?? 0),
+        stok_minimum_ml: Number(w.stok_minimum_ml ?? 0),
+        kapasitas_galon_ml: Number(w.kapasitas_galon_ml ?? 5000),
+        roll_per_galon: Number(w.roll_per_galon ?? 6),
+        luas_per_roll_m2: Number(w.luas_per_roll_m2 ?? 224),
+        konsumsi_ml_per_m2: Number(w.konsumsi_ml_per_m2 ?? 3.72),
+        aktif: Number(w.aktif ?? 1) === 1,
+      })) as DatabaseState['tinta_warna'],
+      cetak_grup: cetak_grup.map((g) => ({
+        ...g,
+        operator_id: Number(g.operator_id),
+        machine_id: Number(g.machine_id),
+      })) as DatabaseState['cetak_grup'],
+      cetak_grup_item: cetak_grup_item.map((item) => ({
+        ...item,
+        grup_id: Number(item.grup_id),
+        order_item_id: Number(item.order_item_id),
+        qty_cetak: Number(item.qty_cetak),
+        panjang_file_m: num(item.panjang_file_m),
+        lebar_file_m: num(item.lebar_file_m),
+        roll_id: num(item.roll_id),
+        cattoff_id: num(item.cattoff_id),
+        offcut_id: num(item.offcut_id),
+        offcut_lebar_m: num(item.offcut_lebar_m),
+        offcut_panjang_m: num(item.offcut_panjang_m),
+        masuk_wos_m2: Number(item.masuk_wos_m2 ?? 0),
+      })) as DatabaseState['cetak_grup_item'],
+      pemakaian_tinta: pemakaian_tinta.map((p) => ({
+        ...p,
+        order_item_id: Number(p.order_item_id),
+        grup_id: num(p.grup_id),
+        tinta_warna_id: Number(p.tinta_warna_id),
+        jumlah_ml: Number(p.jumlah_ml),
+        luas_cetak_m2: Number(p.luas_cetak_m2),
+      })) as DatabaseState['pemakaian_tinta'],
       orders: orders.map((o) => ({
         ...o,
         total_tagihan: Number(o.total_tagihan),
@@ -428,6 +904,11 @@ export class MySqlAdapter {
         satuan_hitung: i.satuan_hitung ?? 'pcs',
         klik_per_lembar: Number(i.klik_per_lembar ?? 1),
         ukuran_lembar: i.ukuran_lembar ?? null,
+        ditata_at: i.ditata_at ?? null,
+        qty_tercetak: Number(i.qty_tercetak ?? 0),
+        acc_pelanggan_id: num(i.acc_pelanggan_id),
+        foto_finishing: i.foto_finishing ?? null,
+        foto_cetak_ulang: i.foto_cetak_ulang ?? null,
       })) as DatabaseState['order_items'],
       order_payments: order_payments.map((p) => ({
         ...p,
@@ -436,6 +917,7 @@ export class MySqlAdapter {
       })) as DatabaseState['order_payments'],
       design_revisions: design_revisions as DatabaseState['design_revisions'],
       advertising_spks: advertising_spks as DatabaseState['advertising_spks'],
+      finishing_stages: [] as DatabaseState['finishing_stages'],
       material_logs: material_logs.map((l) => ({
         ...l,
         luas_netto_m2: Number(l.luas_netto_m2),
@@ -487,6 +969,30 @@ export class MySqlAdapter {
         ...w,
         attempts: Number(w.attempts ?? 0),
       })) as DatabaseState['whatsapp_outbox'],
+      whatsapp_gateway_config: whatsapp_gateway_config[0]
+        ? ({
+            ...whatsapp_gateway_config[0],
+            id: Number(whatsapp_gateway_config[0].id) || 1,
+            webhook_url: String(whatsapp_gateway_config[0].webhook_url ?? ''),
+            webhook_token: String(whatsapp_gateway_config[0].webhook_token ?? ''),
+            app_url: String(whatsapp_gateway_config[0].app_url ?? ''),
+            aktif: Number(whatsapp_gateway_config[0].aktif ?? 0) === 1,
+            updated_at: whatsapp_gateway_config[0].updated_at ?? null,
+            updated_by: num(whatsapp_gateway_config[0].updated_by),
+          } as WhatsAppGatewayConfig)
+        : null,
+      tax_settings: tax_settings[0]
+        ? ({
+            id: Number(tax_settings[0].id) || 1,
+            ppn_persen_default: Number(tax_settings[0].ppn_persen_default ?? 11),
+            pph23_persen_default: Number(tax_settings[0].pph23_persen_default ?? 2),
+            mode_harga: (tax_settings[0].mode_harga === 'sudah_termasuk_ppn' ? 'sudah_termasuk_ppn' : 'belum_termasuk_ppn') as TaxPriceMode,
+            ppn_termasuk_diskon: Number(tax_settings[0].ppn_termasuk_diskon ?? 1) === 1,
+            potong_pph23_otomatis: Number(tax_settings[0].potong_pph23_otomatis ?? 0) === 1,
+            updated_at: tax_settings[0].updated_at ?? null,
+            updated_by: num(tax_settings[0].updated_by),
+          } as TaxSettings)
+        : null,
       insentif_rates: insentif_rates.map((r) => ({
         ...r,
         nominal: Number(r.nominal ?? 0),
@@ -504,6 +1010,11 @@ export class MySqlAdapter {
         supplies: maxId(supplies),
         supply_usages: maxId(supply_usages),
         print_batches: maxId(print_batches),
+        stok_cattoff: maxId(stok_cattoff),
+        tinta_warna: maxId(tinta_warna),
+        cetak_grup: maxId(cetak_grup),
+        cetak_grup_item: maxId(cetak_grup_item),
+        pemakaian_tinta: maxId(pemakaian_tinta),
         orders: maxId(orders),
         order_items: maxId(order_items),
         order_payments: maxId(order_payments),
@@ -530,9 +1041,16 @@ export class MySqlAdapter {
       await conn.beginTransaction();
       await conn.query('SET FOREIGN_KEY_CHECKS = 0');
       const tables = [
+        'pemakaian_tinta',
+        'cetak_grup_item',
+        'cetak_grup',
         'print_batches',
         'supply_usages',
+        'tinta_warna',
+        'stok_cattoff',
         'whatsapp_outbox',
+        'whatsapp_gateway_config',
+        'tax_settings',
         'insentif_rates',
         'supplier_payments',
         'goods_receipts',
@@ -650,6 +1168,45 @@ export class MySqlAdapter {
           ],
         );
       }
+      for (const c of state.stok_cattoff) {
+        await conn.query(
+          `INSERT INTO stok_cattoff (id, kode, jenis_bahan, lebar_m, panjang_awal_m, panjang_sisa_m, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            c.id,
+            c.kode,
+            c.jenis_bahan,
+            c.lebar_m,
+            c.panjang_awal_m,
+            c.panjang_sisa_m,
+            c.status,
+            c.created_at,
+            c.updated_at,
+          ],
+        );
+      }
+      for (const w of state.tinta_warna) {
+        await conn.query(
+          `INSERT INTO tinta_warna (id, kode, warna, satuan, stok_ml, stok_minimum_ml, kapasitas_galon_ml,
+             roll_per_galon, luas_per_roll_m2, konsumsi_ml_per_m2, aktif, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            w.id,
+            w.kode,
+            w.warna,
+            w.satuan,
+            w.stok_ml,
+            w.stok_minimum_ml,
+            w.kapasitas_galon_ml,
+            w.roll_per_galon,
+            w.luas_per_roll_m2,
+            w.konsumsi_ml_per_m2,
+            w.aktif ? 1 : 0,
+            w.created_at,
+            w.updated_at,
+          ],
+        );
+      }
       for (const f of state.finishings) {
         await conn.query(
           'INSERT INTO finishings (id, nama_finishing, ekstra_kiri_cm, ekstra_kanan_cm, ekstra_atas_cm, ekstra_bawah_cm) VALUES (?, ?, ?, ?, ?, ?)',
@@ -676,7 +1233,7 @@ export class MySqlAdapter {
              status_desain, catatan_desain, lampiran_briefing, file_master_arsip, waktu_terima_desain, waktu_selesai_desain,
              tanda_tangan_desainer, tanda_tangan_admin, bukti_pelunasan, foto_serah_terima, tanda_tangan_pengambil, nama_pengambil, no_wa_pengambil,
              waktu_serah_terima, catatan_pengecualian, deadline, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             o.id, o.no_nota, o.customer_id, o.user_id, o.designer_id, o.total_tagihan, o.jumlah_dp,
             o.status_bayar, o.status_nota ?? 'aktif', o.alasan_batal ?? null, o.diskon_persen ?? 0,
@@ -696,9 +1253,11 @@ export class MySqlAdapter {
           `INSERT INTO order_items (id, order_id, nama_item, product_id, finishing_id, lebar_m, tinggi_m, qty, luas_tagihan_m2,
              harga_satuan_dipakai, harga_sebelum_diskon, diskon_persen, diskon_nominal, subtotal, status_produksi,
              machine_id, operator_id, finishing_user_id, waktu_mulai_cetak, waktu_selesai_cetak, klik_total, estimasi_tinta_ml, batch_id,
-             satuan_hitung, klik_per_lembar, ukuran_lembar,
-             acc_admin_id, waktu_acc, file_preview_acc, file_cetak_tiff, file_master_arsip, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             satuan_hitung, klik_per_lembar, ukuran_lembar, ditata_at, qty_tercetak,
+              acc_admin_id, waktu_acc, acc_pelanggan_id, acc_pelanggan_at, acc_pelanggan_nama,
+              file_preview_acc, file_cetak_tiff, file_master_arsip, foto_finishing, foto_cetak_ulang,
+              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             it.id, it.order_id, it.nama_item, it.product_id, it.finishing_id, it.lebar_m, it.tinggi_m,
             it.qty, it.luas_tagihan_m2, it.harga_satuan_dipakai, it.harga_sebelum_diskon ?? it.subtotal,
@@ -707,8 +1266,72 @@ export class MySqlAdapter {
             it.waktu_mulai_cetak ?? null, it.waktu_selesai_cetak ?? null,
             it.klik_total ?? null, it.estimasi_tinta_ml ?? null, it.batch_id ?? null,
             it.satuan_hitung ?? 'pcs', it.klik_per_lembar ?? 1, it.ukuran_lembar ?? null,
-            it.acc_admin_id, it.waktu_acc, it.file_preview_acc, it.file_cetak_tiff, it.file_master_arsip,
+            it.ditata_at ?? null, it.qty_tercetak ?? 0,
+            it.acc_admin_id, it.waktu_acc,
+            it.acc_pelanggan_id ?? null,
+            it.acc_pelanggan_at ?? null, it.acc_pelanggan_nama ?? null,
+            it.file_preview_acc, it.file_cetak_tiff, it.file_master_arsip,
+            it.foto_finishing ?? null, it.foto_cetak_ulang ?? null,
             it.created_at, it.updated_at,
+          ],
+        );
+      }
+      for (const g of state.cetak_grup) {
+        await conn.query(
+          `INSERT INTO cetak_grup (id, kode_grup, operator_id, machine_id, status, tanggal, catatan, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            g.id,
+            g.kode_grup,
+            g.operator_id,
+            g.machine_id,
+            g.status,
+            g.tanggal,
+            g.catatan ?? null,
+            g.created_at,
+            g.updated_at,
+          ],
+        );
+      }
+      for (const gi of state.cetak_grup_item) {
+        await conn.query(
+          `INSERT INTO cetak_grup_item (id, grup_id, order_item_id, qty_cetak, panjang_file_m, lebar_file_m,
+             sumber_bahan, roll_id, cattoff_id, offcut_id, offcut_lebar_m, offcut_panjang_m,
+             masuk_wos_m2, status, catatan, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            gi.id,
+            gi.grup_id,
+            gi.order_item_id,
+            gi.qty_cetak,
+            gi.panjang_file_m ?? null,
+            gi.lebar_file_m ?? null,
+            gi.sumber_bahan,
+            gi.roll_id ?? null,
+            gi.cattoff_id ?? null,
+            gi.offcut_id ?? null,
+            gi.offcut_lebar_m ?? null,
+            gi.offcut_panjang_m ?? null,
+            gi.masuk_wos_m2 ?? 0,
+            gi.status,
+            gi.catatan ?? null,
+            gi.updated_at,
+          ],
+        );
+      }
+      for (const p of state.pemakaian_tinta) {
+        await conn.query(
+          `INSERT INTO pemakaian_tinta (id, order_item_id, grup_id, tinta_warna_id, warna, jumlah_ml, luas_cetak_m2, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            p.id,
+            p.order_item_id,
+            p.grup_id ?? null,
+            p.tinta_warna_id,
+            p.warna,
+            p.jumlah_ml,
+            p.luas_cetak_m2,
+            p.created_at,
           ],
         );
       }
@@ -835,13 +1458,46 @@ export class MySqlAdapter {
       }
       for (const w of state.whatsapp_outbox) {
         await conn.query(
-          `INSERT INTO whatsapp_outbox (id, event, dedupe_key, order_id, no_wa, pesan, link, status,
+          `INSERT INTO whatsapp_outbox (id, event, dedupe_key, order_id, no_wa, pesan, link, media_path, status,
              attempts, last_error, next_attempt_at, created_at, updated_at, sent_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            w.id, w.event, w.dedupe_key, w.order_id ?? null, w.no_wa, w.pesan, w.link ?? null,
+            w.id, w.event, w.dedupe_key, w.order_id ?? null, w.no_wa, w.pesan, w.link ?? null, w.media_path ?? null,
             w.status, w.attempts ?? 0, w.last_error ?? null, w.next_attempt_at ?? null,
             w.created_at, w.updated_at, w.sent_at ?? null,
+          ],
+        );
+      }
+      if (state.whatsapp_gateway_config) {
+        const c = state.whatsapp_gateway_config;
+        await conn.query(
+          `INSERT INTO whatsapp_gateway_config (id, webhook_url, webhook_token, app_url, aktif, updated_at, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            c.id || 1,
+            c.webhook_url ?? '',
+            c.webhook_token ?? '',
+            c.app_url ?? '',
+            c.aktif === false ? 0 : 1,
+            c.updated_at ?? null,
+            c.updated_by ?? null,
+          ],
+        );
+      }
+      if (state.tax_settings) {
+        const t = state.tax_settings;
+        await conn.query(
+          `INSERT INTO tax_settings (id, ppn_persen_default, pph23_persen_default, mode_harga, ppn_termasuk_diskon, potong_pph23_otomatis, updated_at, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            t.id || 1,
+            t.ppn_persen_default,
+            t.pph23_persen_default,
+            t.mode_harga,
+            t.ppn_termasuk_diskon ? 1 : 0,
+            t.potong_pph23_otomatis ? 1 : 0,
+            t.updated_at ?? null,
+            t.updated_by ?? null,
           ],
         );
       }

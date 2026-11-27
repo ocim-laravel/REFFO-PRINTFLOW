@@ -44,11 +44,15 @@ export const STATUS_PRODUKSI_LABEL: Record<ProductionStatus, string> = {
   menunggu_acc: 'Menunggu ACC Admin',
   revisi: 'Revisi Desain',
   antrean_cetak: 'Antrean Cetak',
+  siap_tata: 'Sudah Ditata (Maintop)',
   proses_cetak: 'Proses Cetak',
+  gagal_cetak: 'Gagal Cetak (Ulang)',
+  cetak_ulang: 'Cetak Ulang (QC)',
   antrean_finishing: 'Antrean Finishing',
   proses_finishing: 'Proses Finishing',
   siap_diambil: 'Siap Diambil',
   selesai: 'Selesai',
+  dibatalkan: 'Dibatalkan',
 };
 
 export const STATUS_SPK_LABEL: Record<SpkFieldStatus, string> = {
@@ -187,6 +191,7 @@ export function statusBadgeStyle(status: string): string {
     case 'menunggu_acc':
     case 'revisi':
     case 'proses_desain':
+    case 'siap_tata':
     case 'proses_cetak':
     case 'proses_finishing':
     case 'perakitan':
@@ -195,6 +200,9 @@ export function statusBadgeStyle(status: string): string {
     case 'belum_lunas':
     case 'habis':
     case 'terpakai':
+    case 'gagal_cetak':
+    case 'cetak_ulang':
+    case 'dibatalkan':
       return 'bg-rose-50 text-rose-700 border-rose-200';
     default:
       return 'bg-slate-100 text-slate-700 border-slate-200';

@@ -132,11 +132,49 @@ Reffo PrintFlow terhubung ke MySQL localhost.
 Reffo PrintFlow server berjalan pada http://0.0.0.0:3000
 ```
 
+### 7. Jalankan WhatsApp Bridge Lokal (opsional, disarankan)
+
+Aplikasi bisa mengirim WhatsApp otomatis walaupun dijalankan di `localhost`. Bridge jalan di PC yang sama, jadi **tidak perlu IP publik, port forwarding, atau membuka WhatsApp Web manual**.
+
+1. Pastikan `.env` berisi:
+
+   ```env
+   WHATSAPP_WEBHOOK_URL="http://127.0.0.1:3101/send"
+   WA_BRIDGE_PORT="3101"
+   WA_BRIDGE_AUTH_DIR="wa-bridge/auth"
+   ```
+
+2. Jalankan **dua terminal**:
+
+   ```powershell
+   # terminal 1 — aplikasi
+   npm run dev
+
+   # terminal 2 — bridge WhatsApp
+   npm run wa:bridge
+   ```
+
+3. Buka **http://127.0.0.1:3101/qr**, lalu pindai memakai WhatsApp di HP (⋮ → **Perangkat Tertaut** → **Tautkan perangkat**). QR hanya perlu dipindai **sekali**; sesi tersimpan di `wa-bridge/auth/`.
+
+4. Cek **http://127.0.0.1:3101/health**. Nilai `whatsapp` harus `connected`.
+
+5. Uji dengan membuat nota atau pengingat. Status di **Owner → Integrasi & Pemeliharaan** harus berubah dari `pending` menjadi `terkirim`.
+
+6. Konfigurasi gateway juga bisa diubah tanpa restart server melalui menu **Owner → Setting WhatsApp Gateway**. Di halaman tersebut, Owner dapat mengubah Webhook URL, token, APP URL, mengaktifkan/nonaktifkan gateway, serta mengirim pesan uji ke nomor tertentu.
+
+Catatan:
+
+- `WA_BRIDGE_TOKEN` boleh kosong. Bila diisi, isi juga `WHATSAPP_WEBHOOK_TOKEN` dengan nilai sama.
+- Bridge otomatis menambahkan tautan Self-ACC/nota ke pesan dan mencegah pengiriman ganda.
+- Lima event yang dikirim: `nota_dibuat`, `preview_siap_acc`, `siap_diambil`, `piutang_jatuh_tempo`, `pajak_reklame_jatuh_tempo`.
+- Bila bridge belum tersambung, pesan tetap `pending` dan aplikasi mencoba ulang maksimal 3 kali.
+- Folder `wa-bridge/auth/` sudah masuk `.gitignore`; jangan pernah di-commit.
+
 ---
 
 ## C. Akun Awal (Seed)
 
-Semua akun awal memakai password: **`password123`**
+Semua akun awal memakai password acak yang ditulis ke **`data/initial-credentials.txt`**. File ini tidak ikut git; segera ganti password lalu hapus file tersebut.
 
 | Nama | Email | Peran |
 | --- | --- | --- |
@@ -178,7 +216,7 @@ Lanjutkan ke:
   - desainer: Rp1.500/item + Rp5.000/nota
   - operator cetak: Rp2.000/item + Rp5.000/nota
   - finishing: Rp1.500/item + Rp5.000/nota
-- **Integrasi & Pemeliharaan** — isi tanggal pajak reklame per instansi dan jendela pengingat (default H-30). Gateway WA opsional; tanpa `WHATSAPP_WEBHOOK_URL`, pesan tetap antre dengan status `pending`.
+- **Integrasi & Pemeliharaan** — isi tanggal pajak reklame per instansi dan jendela pengingat (default H-30). Gateway WA bisa memakai bridge lokal (lihat bagian B.7); tanpa `WHATSAPP_WEBHOOK_URL`, pesan tetap antre dengan status `pending`.
 
 ### 2. Admin / Kasir — buat nota pertama
 
@@ -302,7 +340,9 @@ Restore:
 | MySQL connection refused | Nyalakan MySQL/XAMPP, cek host & port |
 | Access denied | Cek `MYSQL_USER` / `MYSQL_PASSWORD` |
 | Login cepat tidak muncul | Normal jika `ENABLE_DEMO_SWITCH=false` |
-| Pesan WA tetap `pending` | Normal tanpa `WHATSAPP_WEBHOOK_URL` |
+| Pesan WA tetap `pending` | Cek `WHATSAPP_WEBHOOK_URL`; bila memakai bridge, pastikan `npm run wa:bridge` jalan dan `/health` menunjukkan `connected` |
+| `/qr` tidak menampilkan QR | Bridge belum sempat terhubung atau sesi sudah tersambung; tunggu beberapa detik atau cek `/health` |
+| `/send` menjawab 503 | WhatsApp bridge belum `connected`; pindai QR atau tunggu reconnect |
 | Password seed tidak berhasil | Seed hanya untuk data baru; reset lewat **Staf & Audit Log** |
 | Ingin data contoh lagi | Mode JSON: kembalikan `data/db.json` dari backup bersih. Mode MySQL: dropp database lalu restart agar seed ulang |
 

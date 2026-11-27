@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Download, RefreshCw, TrendingUp, Users } from 'lucide-react';
 import { formatDesimal, formatRupiah } from '../../lib/format';
-import { apiFetch, getApiToken } from '../../lib/api';
+import { apiFetch, downloadAuthorized } from '../../lib/api';
 
 interface ProfitProdukRow {
   product_id: number;
@@ -80,13 +80,15 @@ export const OwnerProfitabilitasView: React.FC<OwnerProfitabilitasViewProps> = (
     load();
   }, [load]);
 
-  const unduh = (type: 'profit_produk' | 'profit_pelanggan') => {
+  const unduh = async (type: 'profit_produk' | 'profit_pelanggan') => {
     const qs = new URLSearchParams({ type });
     if (dari) qs.set('dari', dari);
     if (sampai) qs.set('sampai', sampai);
-    const token = getApiToken();
-    if (token) qs.set('token', token);
-    window.open(`/api/owner/reports/export?${qs.toString()}`, '_blank', 'noopener');
+    try {
+      await downloadAuthorized(`/api/owner/reports/export?${qs.toString()}`, `reffo-${type}.csv`);
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal mengekspor laporan.');
+    }
   };
 
   return (

@@ -93,6 +93,14 @@ export interface DatabaseState {
   order_payments: Omit<OrderPayment, 'admin_name'>[];
   design_revisions: Omit<DesignRevision, 'admin_name'>[];
   advertising_spks: Omit<AdvertisingSpk, 'no_nota' | 'instansi' | 'nama_pelanggan' | 'deadline'>[];
+  finishing_stages: Array<{
+    id: number;
+    order_item_id: number;
+    stage: 'potong' | 'laminasi' | 'jahit' | 'qc_fisik' | 'selesai';
+    foto_path: string | null;
+    catatan: string | null;
+    created_at: string;
+  }>;
   material_logs: Omit<MaterialLog, 'no_nota' | 'product_name' | 'kode_roll'>[];
   operational_expenses: OperationalExpense[];
   shifts: Shift[];
@@ -753,6 +761,7 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       kurir_nama: null,
       resi_pengiriman: null,
       waktu_serah_terima: null,
+      tracking_status: 'belum_dikirim',
       catatan_pengecualian: null,
       deadline: isoOffsetDays(1, 17),
       created_at: isoOffsetDays(0, 8),
@@ -784,6 +793,7 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       kurir_nama: null,
       resi_pengiriman: null,
       waktu_serah_terima: null,
+      tracking_status: 'belum_dikirim',
       catatan_pengecualian: null,
       deadline: isoOffsetDays(1, 12),
       created_at: isoOffsetDays(-1, 8),
@@ -815,6 +825,7 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       kurir_nama: null,
       resi_pengiriman: null,
       waktu_serah_terima: null,
+      tracking_status: 'belum_dikirim',
       catatan_pengecualian: null,
       deadline: isoOffsetDays(2, 16),
       created_at: isoOffsetDays(-1, 10),
@@ -846,6 +857,7 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       kurir_nama: null,
       resi_pengiriman: null,
       waktu_serah_terima: null,
+      tracking_status: 'belum_dikirim',
       catatan_pengecualian: null,
       deadline: isoOffsetDays(0, 17),
       created_at: isoOffsetDays(-2, 9),
@@ -877,6 +889,7 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       kurir_nama: null,
       resi_pengiriman: null,
       waktu_serah_terima: null,
+      tracking_status: 'belum_dikirim',
       catatan_pengecualian: null,
       deadline: isoOffsetDays(2, 15),
       created_at: isoOffsetDays(0, 11),
@@ -908,6 +921,7 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       kurir_nama: 'Kurir PT Graha',
       resi_pengiriman: null,
       waktu_serah_terima: isoOffsetDays(-3, 16),
+      tracking_status: 'dikirim',
       catatan_pengecualian: null,
       deadline: isoOffsetDays(-3, 17),
       created_at: isoOffsetDays(-4, 9),
@@ -1156,11 +1170,17 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
   ];
 
   // Fix order 2 total_tagihan to exact sum (666000 + 214200 + 500000 = 1380200), order 4 (580000+300000 = 880000), order 6 (900000+504000 = 1404000)
-  orders[1].total_tagihan = 1380200;
-  orders[1].jumlah_dp = 1380200;
-  orders[3].total_tagihan = 880000;
-  orders[5].total_tagihan = 1404000;
-  orders[5].jumlah_dp = 1404000;
+  if (orders[1]) {
+    orders[1].total_tagihan = 1380200;
+    orders[1].jumlah_dp = 1380200;
+  }
+  if (orders[3]) {
+    orders[3].total_tagihan = 880000;
+  }
+  if (orders[5]) {
+    orders[5].total_tagihan = 1404000;
+    orders[5].jumlah_dp = 1404000;
+  }
 
   const order_payments: DatabaseState['order_payments'] = [
     {
@@ -1265,6 +1285,14 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       lokasi_pasang: 'Ballroom Lt. 3 Hotel Mulia Sentral',
       catatan_teknis: 'Akses loading dock dibuka pukul 21.00 WIB, wajib helm proyek.',
       status_lapangan: 'perakitan',
+      foto_before: null,
+      foto_after: null,
+      lat: null,
+      lng: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
+      travel_status: null,
+      travel_notes: null,
       created_at: isoOffsetDays(-1, 8),
       updated_at: isoOffsetDays(0, 9),
     },
@@ -1276,6 +1304,14 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
       lokasi_pasang: 'Lobby Utama PT Graha Nusantara Mandiri',
       catatan_teknis: 'Gunakan timer otomatis lampu 18.00-06.00 WIB.',
       status_lapangan: 'selesai',
+      foto_before: null,
+      foto_after: null,
+      lat: null,
+      lng: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
+      travel_status: null,
+      travel_notes: null,
       created_at: isoOffsetDays(-4, 9),
       updated_at: isoOffsetDays(-3, 15),
     },
@@ -1420,6 +1456,7 @@ function createInitialSeed(writeCredentials = true): DatabaseState {
     order_payments,
     design_revisions,
     advertising_spks,
+    finishing_stages: [],
     material_logs,
     operational_expenses,
     shifts: [],
@@ -2008,6 +2045,9 @@ class Store {
       approval_status: raw.approval_status ?? 'belum',
       approval_note: raw.approval_note ?? null,
       tanda_tangan_pengambil: raw.tanda_tangan_pengambil ?? null,
+      kurir_nama: raw.kurir_nama ?? null,
+      resi_pengiriman: raw.resi_pengiriman ?? null,
+      tracking_status: raw.tracking_status ?? 'belum_dikirim',
       customer,
       admin_name: admin?.name ?? 'Admin',
       designer_name: designer?.name ?? null,

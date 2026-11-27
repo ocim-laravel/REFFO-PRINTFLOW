@@ -251,11 +251,12 @@ export function resolveBulkTiffMapping(params: {
         if (itemById.has(candidateId)) matchedId = candidateId;
       }
       if (!matchedId) {
-        const prefixIdxMatch = filename.match(/^0*(\d+)[-_.\s]/);
+        const prefixIdxMatch = filename.match(/^0*(\d+)[-_.\\s]/);
         if (prefixIdxMatch) {
           const idx = Number(prefixIdxMatch[1]) - 1;
           if (idx >= 0 && idx < items.length) {
-            matchedId = items[idx].id;
+            const item = items[idx];
+            if (item?.id) matchedId = item.id;
           }
         }
       }

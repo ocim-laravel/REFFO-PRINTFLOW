@@ -178,14 +178,16 @@ CREATE TABLE IF NOT EXISTS order_items (
   subtotal DECIMAL(12,2) NOT NULL,
   status_produksi ENUM(
     'menunggu_desain','proses_desain','menunggu_acc','revisi',
-    'antrean_cetak','proses_cetak','antrean_finishing',
-    'proses_finishing','siap_diambil','selesai'
+    'antrean_cetak','siap_tata','proses_cetak','gagal_cetak','cetak_ulang',
+    'antrean_finishing','proses_finishing','siap_diambil','selesai','dibatalkan'
   ) NOT NULL DEFAULT 'menunggu_desain',
   machine_id INT NULL,
   operator_id INT NULL,
   finishing_user_id INT NULL,
   waktu_mulai_cetak VARCHAR(40) NULL,
   waktu_selesai_cetak VARCHAR(40) NULL,
+  ditata_at VARCHAR(40) NULL,
+  qty_tercetak INT NOT NULL DEFAULT 0,
   klik_total INT NULL,
   estimasi_tinta_ml DECIMAL(10,2) NULL,
   batch_id INT NULL,
@@ -194,9 +196,14 @@ CREATE TABLE IF NOT EXISTS order_items (
   ukuran_lembar VARCHAR(80) NULL,
   acc_admin_id INT NULL,
   waktu_acc VARCHAR(40) NULL,
+  acc_pelanggan_at VARCHAR(40) NULL,
+  acc_pelanggan_nama VARCHAR(150) NULL,
+  acc_pelanggan_id INT NULL,
   file_preview_acc VARCHAR(255) NULL,
   file_cetak_tiff VARCHAR(255) NULL,
   file_master_arsip VARCHAR(255) NULL,
+  foto_finishing VARCHAR(255) NULL,
+  foto_cetak_ulang VARCHAR(255) NULL,
   created_at VARCHAR(40) NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
   FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
@@ -400,6 +407,7 @@ CREATE TABLE IF NOT EXISTS whatsapp_outbox (
   no_wa VARCHAR(30) NOT NULL,
   pesan TEXT NOT NULL,
   link TEXT NULL,
+  media_path VARCHAR(255) NULL,
   status ENUM('pending','terkirim','gagal') NOT NULL DEFAULT 'pending',
   attempts INT NOT NULL DEFAULT 0,
   last_error TEXT NULL,
@@ -417,6 +425,113 @@ CREATE TABLE IF NOT EXISTS insentif_rates (
   updated_at VARCHAR(40) NULL,
   updated_by INT NULL,
   UNIQUE KEY uq_insentif_role_jenis (role, jenis)
+);
+
+CREATE TABLE IF NOT EXISTS whatsapp_gateway_config (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  webhook_url VARCHAR(500) NOT NULL DEFAULT '',
+  webhook_token VARCHAR(500) NOT NULL DEFAULT '',
+  app_url VARCHAR(500) NOT NULL DEFAULT '',
+  aktif TINYINT(1) NOT NULL DEFAULT 0,
+  updated_at VARCHAR(40) NULL,
+  updated_by INT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tax_settings (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  ppn_persen_default DECIMAL(5,2) NOT NULL DEFAULT 11,
+  pph23_persen_default DECIMAL(5,2) NOT NULL DEFAULT 2,
+  mode_harga ENUM('belum_termasuk_ppn','sudah_termasuk_ppn') NOT NULL DEFAULT 'belum_termasuk_ppn',
+  ppn_termasuk_diskon TINYINT(1) NOT NULL DEFAULT 1,
+  potong_pph23_otomatis TINYINT(1) NOT NULL DEFAULT 0,
+  updated_at VARCHAR(40) NULL,
+  updated_by INT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stok_cattoff (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  kode VARCHAR(50) NOT NULL UNIQUE,
+  jenis_bahan VARCHAR(80) NOT NULL,
+  lebar_m DECIMAL(5,2) NOT NULL,
+  panjang_awal_m DECIMAL(8,2) NOT NULL,
+  panjang_sisa_m DECIMAL(8,2) NOT NULL,
+  status ENUM('aktif','habis') NOT NULL DEFAULT 'aktif',
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS finishing_stages (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  order_item_id INT NOT NULL,
+  stage ENUM('potong','laminasi','jahit','qc_fisik','selesai') NOT NULL,
+  foto_path VARCHAR(255) NULL,
+  catatan VARCHAR(255) NULL,
+  created_at VARCHAR(40) NOT NULL,
+  FOREIGN KEY (order_item_id) REFERENCES order_items(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS tinta_warna (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  kode VARCHAR(30) NOT NULL UNIQUE,
+  warna VARCHAR(50) NOT NULL,
+  satuan VARCHAR(20) NOT NULL DEFAULT 'ml',
+  stok_ml DECIMAL(12,2) NOT NULL DEFAULT 0,
+  stok_minimum_ml DECIMAL(12,2) NOT NULL DEFAULT 1000,
+  kapasitas_galon_ml DECIMAL(12,2) NOT NULL DEFAULT 5000,
+  roll_per_galon INT NOT NULL DEFAULT 6,
+  luas_per_roll_m2 DECIMAL(8,2) NOT NULL DEFAULT 224,
+  konsumsi_ml_per_m2 DECIMAL(8,2) NOT NULL DEFAULT 3.72,
+  aktif TINYINT(1) NOT NULL DEFAULT 1,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pemakaian_tinta (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  order_item_id INT NOT NULL,
+  grup_id INT NULL,
+  tinta_warna_id INT NOT NULL,
+  warna VARCHAR(50) NOT NULL,
+  jumlah_ml DECIMAL(10,2) NOT NULL,
+  luas_cetak_m2 DECIMAL(10,2) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  FOREIGN KEY (order_item_id) REFERENCES order_items(id) ON DELETE CASCADE,
+  FOREIGN KEY (tinta_warna_id) REFERENCES tinta_warna(id)
+);
+
+CREATE TABLE IF NOT EXISTS cetak_grup (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  kode_grup VARCHAR(40) NOT NULL UNIQUE,
+  operator_id INT NOT NULL,
+  machine_id INT NOT NULL,
+  status ENUM('menunggu','dalam_proses','selesai','batal') NOT NULL DEFAULT 'menunggu',
+  tanggal VARCHAR(40) NOT NULL,
+  catatan TEXT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  FOREIGN KEY (operator_id) REFERENCES users(id),
+  FOREIGN KEY (machine_id) REFERENCES print_machines(id)
+);
+
+CREATE TABLE IF NOT EXISTS cetak_grup_item (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  grup_id INT NOT NULL,
+  order_item_id INT NOT NULL,
+  qty_cetak INT NOT NULL,
+  panjang_file_m DECIMAL(8,2) NULL,
+  lebar_file_m DECIMAL(8,2) NULL,
+  sumber_bahan ENUM('roll','cattoff','offcut') NOT NULL DEFAULT 'roll',
+  roll_id INT NULL,
+  cattoff_id INT NULL,
+  offcut_id INT NULL,
+  offcut_lebar_m DECIMAL(5,2) NULL,
+  offcut_panjang_m DECIMAL(8,2) NULL,
+  masuk_wos_m2 DECIMAL(10,2) NOT NULL DEFAULT 0,
+  status ENUM('menunggu','selesai','kendala') NOT NULL DEFAULT 'menunggu',
+  catatan TEXT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  FOREIGN KEY (grup_id) REFERENCES cetak_grup(id) ON DELETE CASCADE,
+  FOREIGN KEY (order_item_id) REFERENCES order_items(id) ON DELETE CASCADE
 );
 
 -- Indeks performa dibuat otomatis oleh MySqlAdapter.migrateSchema() agar aman

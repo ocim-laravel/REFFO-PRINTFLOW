@@ -11,8 +11,15 @@ coverage/
 # Folder dibuat otomatis oleh aplikasi saat pertama kali dijalankan.
 data/db.json
 data/*.tmp
+data/backups/
+data/initial-credentials.txt
+data/credentials-reset-*.txt
+data/*.corrupt-*
 uploads/*
 !uploads/.gitkeep
+
+# Sesi login bridge WhatsApp (jangan pernah di-commit)
+wa-bridge/auth/
 
 # Metadata tooling lokal
 .aistudio/

@@ -53,7 +53,7 @@ AUTO_CLEAN_TIFF_HARI=90
 Checklist singkat:
 
 - [ ] `ENABLE_DEMO_SWITCH="false"` agar login cepat divisi tidak bisa dipakai.
-- [ ] Ganti semua kata sandi seed (`password123`) melalui menu **Owner → Staf & Audit Log**.
+- [ ] Ganti semua kata sandi seed acak dari `data/initial-credentials.txt` melalui menu **Owner → Staf & Audit Log**, lalu hapus file tersebut.
 - [ ] `SESSION_SECRET` unik dan rahasia; jangan commit `.env.local`.
 - [ ] Folder `uploads/` di-backup dan di-serve hanya lewat aplikasi.
 - [ ] Akses database dibatasi ke user aplikasi (`SELECT, INSERT, UPDATE, DELETE`).
@@ -155,7 +155,12 @@ Fitur yang masih "Belum" merupakan lanjutan Fase 2–4 pada blueprint
 - WhatsApp Gateway bersifat best-effort: lima event (`nota_dibuat`, `preview_siap_acc`,
   `siap_diambil`, `piutang_jatuh_tempo`, `pajak_reklame_jatuh_tempo`) masuk ke `whatsapp_outbox`.
   Tanpa `WHATSAPP_WEBHOOK_URL`, status tetap `pending` dan bisa dicoba ulang dari menu Integrasi.
-  Dedupe key mencegah pengiriman ganda untuk event yang sama.
+  Dedupe key mencegah pengiriman ganda untuk event yang sama. Untuk pemakaian lokal tanpa
+  langganan gateway, jalankan `npm run wa:bridge`, pindai QR sekali di `http://127.0.0.1:3101/qr`,
+  lalu set `WHATSAPP_WEBHOOK_URL="http://127.0.0.1:3101/send"`. Sesi tersimpan di
+  `wa-bridge/auth/` sehingga tidak perlu membuka WhatsApp Web manual.
+  Owner dapat mengubah Webhook URL, token, APP URL, status aktif, dan mengirim pesan uji lewat menu
+  **Setting WhatsApp Gateway** tanpa restart server.
 - Insentif dihitung otomatis per staf aktif: item selesai × tarif item + nota/job selesai × tarif
   nota per divisi (desainer, operator cetak, finishing). Tarif default bisa diubah Owner di menu
   **KPI & Insentif Tim**; setiap perubahan tercatat di audit log.

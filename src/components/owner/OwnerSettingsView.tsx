@@ -2,11 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { Save, Plus } from 'lucide-react';
 import type {
   Finishing,
+  Instansi,
   MachineKind,
   PrintMachine,
   Product,
   SupplyCategory,
   SupplyItem,
+  TaxPriceMode,
+  TaxSettings,
 } from '../../types';
 import { apiFetch } from '../../lib/api';
 
@@ -15,6 +18,8 @@ interface OwnerSettingsViewProps {
   finishings: Finishing[];
   machines: PrintMachine[];
   supplies: SupplyItem[];
+  instansis: Instansi[];
+  taxSettings?: TaxSettings;
   onRefreshBootstrap: () => Promise<void>;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
@@ -55,6 +60,8 @@ export const OwnerSettingsView: React.FC<OwnerSettingsViewProps> = ({
   finishings,
   machines,
   supplies,
+  instansis,
+  taxSettings,
   onRefreshBootstrap,
   onNotify,
 }) => {
@@ -62,6 +69,20 @@ export const OwnerSettingsView: React.FC<OwnerSettingsViewProps> = ({
   const [finishingDrafts, setFinishingDrafts] = useState<Finishing[]>(finishings);
   const [machineDrafts, setMachineDrafts] = useState<PrintMachine[]>(machines);
   const [supplyDrafts, setSupplyDrafts] = useState<SupplyItem[]>(supplies);
+  const [instansiDrafts, setInstansiDrafts] = useState<Instansi[]>(instansis);
+  const [editingInstansi, setEditingInstansi] = useState<Instansi | null>(null);
+  const [savingInstansi, setSavingInstansi] = useState(false);
+  const [taxDraft, setTaxDraft] = useState<TaxSettings>({
+    id: 1,
+    ppn_persen_default: taxSettings?.ppn_persen_default ?? 11,
+    pph23_persen_default: taxSettings?.pph23_persen_default ?? 2,
+    mode_harga: taxSettings?.mode_harga ?? 'belum_termasuk_ppn',
+    ppn_termasuk_diskon: taxSettings?.ppn_termasuk_diskon ?? true,
+    potong_pph23_otomatis: taxSettings?.potong_pph23_otomatis ?? false,
+    updated_at: taxSettings?.updated_at ?? null,
+    updated_by: taxSettings?.updated_by ?? null,
+  });
+  const [savingTax, setSavingTax] = useState(false);
 
   const [newMachine, setNewMachine] = useState({
     kode_mesin: '',
@@ -111,6 +132,60 @@ export const OwnerSettingsView: React.FC<OwnerSettingsViewProps> = ({
   useEffect(() => {
     setSupplyDrafts(supplies);
   }, [supplies]);
+
+  useEffect(() => {
+    setInstansiDrafts(instansis);
+  }, [instansis]);
+
+  useEffect(() => {
+    if (taxSettings) {
+      setTaxDraft(taxSettings);
+    }
+  }, [taxSettings]);
+
+  const handleSaveTax = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingTax(true);
+    try {
+      await apiFetch('/api/owner/settings/tax', {
+        method: 'PUT',
+        body: JSON.stringify(taxDraft),
+      });
+      await onRefreshBootstrap();
+      onNotify('success', 'Pengaturan pajak global berhasil disimpan.');
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal menyimpan pengaturan pajak.');
+    } finally {
+      setSavingTax(false);
+    }
+  };
+
+  const handleSaveInstansi = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingInstansi) return;
+    setSavingInstansi(true);
+    try {
+      await apiFetch(`/api/instansis/${editingInstansi.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          nama_instansi: editingInstansi.nama_instansi,
+          npwp: editingInstansi.npwp ?? '',
+          is_pkp: Boolean(editingInstansi.is_pkp),
+          ppn_persen: Number(editingInstansi.ppn_persen ?? 0),
+          pph23_persen: Number(editingInstansi.pph23_persen ?? 0),
+          tempo_hari: Number(editingInstansi.tempo_hari ?? 0),
+          credit_limit: Number(editingInstansi.credit_limit ?? 0),
+        }),
+      });
+      setEditingInstansi(null);
+      await onRefreshBootstrap();
+      onNotify('success', 'Pengaturan instansi (limit kredit & pajak) berhasil diperbarui.');
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal menyimpan pengaturan instansi.');
+    } finally {
+      setSavingInstansi(false);
+    }
+  };
 
   const updateProductField = (id: number, field: keyof Product, val: string) => {
     setProductDrafts((prev) =>
@@ -996,6 +1071,312 @@ export const OwnerSettingsView: React.FC<OwnerSettingsViewProps> = ({
           </table>
         </div>
       </form>
+
+      {/* Pengaturan Pajak Indonesia & Faktur */}
+      <form
+        onSubmit={handleSaveTax}
+        className="bg-white rounded-xl border border-slate-200 p-5 space-y-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+          <div>
+            <h2 className="font-display text-sm font-semibold text-slate-900">
+              Pengaturan Pajak Indonesia &amp; Faktur (Global Default)
+            </h2>
+            <p className="text-xs text-slate-500">
+              Prioritas perhitungan nota: Input per-nota → Pengaturan Instansi → Default Global ini.
+            </p>
+          </div>
+          <button
+            type="submit"
+            disabled={savingTax}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-800 disabled:opacity-50 cursor-pointer"
+          >
+            <Save className="h-3.5 w-3.5" />
+            {savingTax ? 'Menyimpan...' : 'Simpan Pengaturan Pajak'}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">PPN Default (%)</label>
+            <input
+              type="number"
+              step="0.1"
+              min={0}
+              max={100}
+              value={taxDraft.ppn_persen_default}
+              onChange={(e) =>
+                setTaxDraft((p) => ({ ...p, ppn_persen_default: Number(e.target.value) || 0 }))
+              }
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+            />
+            <p className="mt-1 text-[11px] text-slate-500">
+              Acuan UU HPP / PMK 131/2024: jasa percetakan &amp; advertising non-mewah efektif 11%.
+            </p>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">PPh 23 Jasa Default (%)</label>
+            <input
+              type="number"
+              step="0.1"
+              min={0}
+              max={100}
+              value={taxDraft.pph23_persen_default}
+              onChange={(e) =>
+                setTaxDraft((p) => ({ ...p, pph23_persen_default: Number(e.target.value) || 0 }))
+              }
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+            />
+            <p className="mt-1 text-[11px] text-slate-500">
+              Tarif standar PPh 23 jasa maklon/periklanan badan: 2% dari DPP.
+            </p>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">Mode Harga Katalog</label>
+            <select
+              value={taxDraft.mode_harga}
+              onChange={(e) =>
+                setTaxDraft((p) => ({ ...p, mode_harga: e.target.value as TaxPriceMode }))
+              }
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+            >
+              <option value="belum_termasuk_ppn">Belum termasuk PPN (DPP + PPN)</option>
+              <option value="sudah_termasuk_ppn">Sudah termasuk PPN (DPP dihitung mundur)</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-5 pt-1">
+          <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={taxDraft.ppn_termasuk_diskon}
+              onChange={(e) =>
+                setTaxDraft((p) => ({ ...p, ppn_termasuk_diskon: e.target.checked }))
+              }
+              className="h-4 w-4 rounded border-slate-300 text-blue-700"
+            />
+            Hitung PPN setelah dikurangi diskon nota
+          </label>
+          <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={taxDraft.potong_pph23_otomatis}
+              onChange={(e) =>
+                setTaxDraft((p) => ({ ...p, potong_pph23_otomatis: e.target.checked }))
+              }
+              className="h-4 w-4 rounded border-slate-300 text-blue-700"
+            />
+            Otomatis potong PPh 23 jika instansi memiliki NPWP
+          </label>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+          <strong>Simulasi Nota Rp 1.000.000:</strong>{' '}
+          {(() => {
+            const contoh = 1_000_000;
+            const ppn = taxDraft.ppn_persen_default;
+            const pph = taxDraft.potong_pph23_otomatis ? taxDraft.pph23_persen_default : 0;
+            if (taxDraft.mode_harga === 'sudah_termasuk_ppn' && ppn > 0) {
+              const dpp = Math.round(contoh / (1 + ppn / 100));
+              const ppnNom = contoh - dpp;
+              const pphNom = Math.round((dpp * pph) / 100);
+              return `DPP Rp ${dpp.toLocaleString('id-ID')} + PPN Rp ${ppnNom.toLocaleString('id-ID')} − PPh23 Rp ${pphNom.toLocaleString('id-ID')} = Total Rp ${(contoh - pphNom).toLocaleString('id-ID')}`;
+            }
+            const ppnNom = Math.round((contoh * ppn) / 100);
+            const pphNom = Math.round((contoh * pph) / 100);
+            return `DPP Rp ${contoh.toLocaleString('id-ID')} + PPN Rp ${ppnNom.toLocaleString('id-ID')} − PPh23 Rp ${pphNom.toLocaleString('id-ID')} = Total Rp ${(contoh + ppnNom - pphNom).toLocaleString('id-ID')}`;
+          })()}
+        </div>
+      </form>
+
+      {/* Master Instansi (Limit Kredit, Tempo, NPWP & Pajak) */}
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="p-4 border-b border-slate-200">
+          <h2 className="font-display text-sm font-semibold text-slate-900">
+            Pengaturan Instansi: Limit Kredit, Tempo &amp; Pajak
+          </h2>
+          <p className="text-xs text-slate-500">
+            Atur batas kredit piutang, tempo jatuh tempo (hari), NPWP, status PKP, PPN, dan PPh 23 per instansi.
+          </p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs sm:text-sm responsive-table">
+            <thead className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+              <tr>
+                <th className="text-left px-4 py-3">Instansi</th>
+                <th className="text-left px-3 py-3">NPWP / PKP</th>
+                <th className="text-right px-3 py-3">PPN / PPh 23</th>
+                <th className="text-right px-3 py-3">Tempo (Hari)</th>
+                <th className="text-right px-3 py-3">Limit Kredit (Rp)</th>
+                <th className="text-right px-4 py-3">Aksi</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {instansiDrafts.map((inst) => (
+                <tr key={inst.id}>
+                  <td data-label="Instansi" className="px-4 py-2.5 font-medium text-slate-900">
+                    {inst.nama_instansi}
+                  </td>
+                  <td data-label="NPWP / PKP" className="px-3 py-2 text-xs text-slate-600">
+                    <span className="font-mono">{inst.npwp || '-'}</span>
+                    <span
+                      className={`ml-2 inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                        inst.is_pkp ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'
+                      }`}
+                    >
+                      {inst.is_pkp ? 'PKP' : 'Non-PKP'}
+                    </span>
+                  </td>
+                  <td data-label="Pajak" className="px-3 py-2 text-right font-mono text-xs text-slate-700">
+                    PPN {inst.ppn_persen ?? 0}% · PPh23 {inst.pph23_persen ?? 0}%
+                  </td>
+                  <td data-label="Tempo" className="px-3 py-2 text-right font-mono text-xs text-slate-700">
+                    {inst.tempo_hari ?? 0} hari
+                  </td>
+                  <td data-label="Limit Kredit" className="px-3 py-2 text-right font-mono text-xs text-slate-700">
+                    Rp {Number(inst.credit_limit ?? 0).toLocaleString('id-ID')}
+                  </td>
+                  <td data-label="Aksi" className="px-4 py-2 text-right">
+                    <button
+                      type="button"
+                      onClick={() => setEditingInstansi({ ...inst })}
+                      className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                    >
+                      Edit
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {editingInstansi && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <form
+            onSubmit={handleSaveInstansi}
+            className="bg-white rounded-xl border border-slate-200 w-full max-w-lg p-6 space-y-4"
+          >
+            <h3 className="font-display text-base font-semibold text-slate-900">
+              Edit Pengaturan Instansi
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-slate-700 mb-1">Nama Instansi *</label>
+                <input
+                  type="text"
+                  required
+                  value={editingInstansi.nama_instansi}
+                  onChange={(e) =>
+                    setEditingInstansi({ ...editingInstansi, nama_instansi: e.target.value })
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">NPWP</label>
+                <input
+                  type="text"
+                  value={editingInstansi.npwp ?? ''}
+                  onChange={(e) =>
+                    setEditingInstansi({ ...editingInstansi, npwp: e.target.value })
+                  }
+                  placeholder="00.000.000.0-000.000"
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div className="flex items-end pb-2">
+                <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(editingInstansi.is_pkp)}
+                    onChange={(e) =>
+                      setEditingInstansi({
+                        ...editingInstansi,
+                        is_pkp: e.target.checked,
+                        ppn_persen: e.target.checked && !(editingInstansi.ppn_persen ?? 0) ? 11 : editingInstansi.ppn_persen,
+                      })
+                    }
+                    className="h-4 w-4 rounded border-slate-300 text-blue-700"
+                  />
+                  Status PKP (Pengusaha Kena Pajak)
+                </label>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">PPN (%)</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={100}
+                  value={editingInstansi.ppn_persen ?? 0}
+                  onChange={(e) =>
+                    setEditingInstansi({ ...editingInstansi, ppn_persen: Number(e.target.value) || 0 })
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">PPh 23 (%)</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={100}
+                  value={editingInstansi.pph23_persen ?? 0}
+                  onChange={(e) =>
+                    setEditingInstansi({ ...editingInstansi, pph23_persen: Number(e.target.value) || 0 })
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Tempo Jatuh Tempo (Hari)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={editingInstansi.tempo_hari ?? 0}
+                  onChange={(e) =>
+                    setEditingInstansi({ ...editingInstansi, tempo_hari: Math.max(0, Number(e.target.value) || 0) })
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Limit Kredit (Rp)</label>
+                <input
+                  type="number"
+                  min={0}
+                  step={50000}
+                  value={editingInstansi.credit_limit ?? 0}
+                  onChange={(e) =>
+                    setEditingInstansi({ ...editingInstansi, credit_limit: Math.max(0, Number(e.target.value) || 0) })
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setEditingInstansi(null)}
+                className="rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="submit"
+                disabled={savingInstansi}
+                className="rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-800 disabled:opacity-50 cursor-pointer"
+              >
+                {savingInstansi ? 'Menyimpan...' : 'Simpan Pengaturan'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 };

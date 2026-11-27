@@ -29,6 +29,7 @@ export type NavKey =
   | 'admin_orders'
   | 'admin_reviews'
   | 'admin_shift'
+  | 'admin_whatsapp'
   | 'desainer_queue'
   | 'operator_queue'
   | 'finishing_queue'
@@ -45,6 +46,7 @@ export type NavKey =
   | 'owner_profitabilitas'
   | 'owner_purchasing'
   | 'owner_integrations'
+  | 'owner_whatsapp_gateway'
   | 'owner_staff'
   | 'owner_settings';
 
@@ -53,6 +55,7 @@ interface NavItem {
   label: string;
   icon: React.ReactNode;
   badge?: number;
+  statusText?: string;
 }
 
 interface AppShellProps {
@@ -68,6 +71,7 @@ interface AppShellProps {
   flash: { type: 'success' | 'error'; message: string } | null;
   onDismissFlash: () => void;
   badges?: Partial<Record<NavKey, number>>;
+  shiftAktif?: boolean;
   demoSwitchEnabled?: boolean;
   children: React.ReactNode;
 }
@@ -102,6 +106,7 @@ export const AppShell: React.FC<AppShellProps> = ({
   flash,
   onDismissFlash,
   badges = {},
+  shiftAktif = false,
   demoSwitchEnabled = true,
   children,
 }) => {
@@ -113,8 +118,14 @@ export const AppShell: React.FC<AppShellProps> = ({
         return [
           { key: 'admin_orders', label: 'Daftar Nota & Order', icon: <ClipboardList className="h-4 w-4" /> },
           { key: 'admin_reviews', label: 'Review Desain (ACC)', icon: <CheckCircle2 className="h-4 w-4" />, badge: badges.admin_reviews },
-          { key: 'admin_shift', label: 'Shift & Tutup Kasir', icon: <Wallet className="h-4 w-4" /> },
+          {
+            key: 'admin_shift',
+            label: 'Shift & Tutup Kasir',
+            icon: <Wallet className="h-4 w-4" />,
+            statusText: shiftAktif ? 'Aktif' : undefined,
+          },
           { key: 'serah_terima', label: 'Serah Terima Barang', icon: <PackageCheck className="h-4 w-4" />, badge: badges.serah_terima },
+          { key: 'admin_whatsapp', label: 'Setting WA (Sementara)', icon: <MessageSquare className="h-4 w-4" /> },
         ];
       case 'desainer':
         return [
@@ -152,11 +163,12 @@ export const AppShell: React.FC<AppShellProps> = ({
           { key: 'owner_insentif', label: 'KPI & Insentif Tim', icon: <Wallet className="h-4 w-4" /> },
           { key: 'owner_profitabilitas', label: 'Analisis Profitabilitas', icon: <TrendingUp className="h-4 w-4" /> },
           { key: 'owner_integrations', label: 'Integrasi & Pemeliharaan', icon: <MessageSquare className="h-4 w-4" /> },
+          { key: 'owner_whatsapp_gateway', label: 'Setting → WhatsApp Gateway', icon: <MessageSquare className="h-4 w-4" /> },
           { key: 'owner_staff', label: 'Staf & Audit Log', icon: <Users className="h-4 w-4" /> },
           { key: 'owner_settings', label: 'Pengaturan Master', icon: <Settings className="h-4 w-4" /> },
         ];
     }
-  }, [user.role, badges]);
+  }, [user.role, badges, shiftAktif]);
 
   const selectItem = (key: NavKey) => {
     onSelectNav(key);
@@ -220,6 +232,11 @@ export const AppShell: React.FC<AppShellProps> = ({
                   <span className="shrink-0">{item.icon}</span>
                   <span className="truncate">{item.label}</span>
                 </span>
+                {item.statusText && (
+                  <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
+                    {item.statusText}
+                  </span>
+                )}
                 {typeof item.badge === 'number' && item.badge > 0 && (
                   <span
                     className={`font-mono tabular-nums text-xs px-1.5 py-0.5 rounded ${

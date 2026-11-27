@@ -12,11 +12,11 @@ interface LoginViewProps {
 
 export const LoginView: React.FC<LoginViewProps> = ({
   accounts,
-  demoSwitchEnabled = true,
+  demoSwitchEnabled = false,
   onAuthenticated,
 }) => {
-  const [email, setEmail] = useState('admin@reffoprint.id');
-  const [password, setPassword] = useState('password123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -87,7 +87,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
             {demoSwitchEnabled ? (
               <>
                 <p className="text-xs font-medium text-slate-400 mb-3">
-                  Masuk cepat menggunakan akun divisi (kata sandi standar: <span className="font-mono text-slate-200">password123</span>)
+                  Masuk cepat akun divisi (hanya untuk development; dinonaktifkan di produksi)
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   {accounts.map((acc) => (

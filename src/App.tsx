@@ -58,14 +58,14 @@ function getPublicApprovalToken(): string | null {
   const fromQuery = params.get('approval');
   if (fromQuery) return fromQuery;
   const match = window.location.pathname.match(/^\/acc\/([^/]+)/);
-  return match ? decodeURIComponent(match[1]) : null;
+  return match ? decodeURIComponent(match[1] ?? '') : null;
 }
 
 class AppErrorBoundary extends Component<
   { children: ReactNode },
   { hasError: boolean; message: string }
 > {
-  state = { hasError: false, message: '' };
+  override state = { hasError: false, message: '' };
 
   static getDerivedStateFromError(error: unknown) {
     return {
@@ -74,11 +74,11 @@ class AppErrorBoundary extends Component<
     };
   }
 
-  componentDidCatch(error: Error, info: ErrorInfo) {
+  override componentDidCatch(error: Error, info: ErrorInfo) {
     console.error('Application error', error, info.componentStack);
   }
 
-  render() {
+  override render() {
     if (this.state.hasError) {
       return (
         <div className="min-h-screen flex items-center justify-center bg-slate-100 p-6">

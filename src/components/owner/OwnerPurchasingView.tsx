@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Download, Plus, RefreshCw, Truck, Wallet, X } from 'lucide-react';
+import { Ban, Download, Eye, Pencil, Plus, RefreshCw, Truck, Wallet, X } from 'lucide-react';
 import type {
   BootstrapPayload,
   GoodsReceipt,
@@ -12,7 +12,7 @@ import type {
   SupplierPayment,
   SupplyItem,
 } from '../../types';
-import { apiFetch, getApiToken } from '../../lib/api';
+import { apiFetch, downloadAuthorized } from '../../lib/api';
 import { formatRupiah, formatTanggalSingkat } from '../../lib/format';
 
 interface OwnerPurchasingViewProps {
@@ -53,10 +53,17 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [supplierForm, setSupplierForm] = useState(false);
+  const [supplierEdit, setSupplierEdit] = useState<SupplierRow | null>(null);
   const [poForm, setPoForm] = useState(false);
+  const [poEditId, setPoEditId] = useState<number | null>(null);
+  const [detailPo, setDetailPo] = useState<{
+    purchase_order: PurchaseOrder;
+    goods_receipts: GoodsReceipt[];
+    payments: SupplierPayment[];
+  } | null>(null);
   const [bayarPo, setBayarPo] = useState<PurchaseOrder | null>(null);
 
-  const [supplierInput, setSupplierInput] = useState({ kode_supplier: '', nama_supplier: '', kontak: '', no_wa: '', alamat: '', npwp: '' });
+  const [supplierInput, setSupplierInput] = useState({ kode_supplier: '', nama_supplier: '', kontak: '', no_wa: '', alamat: '', npwp: '', aktif: true });
   const [poInput, setPoInput] = useState({ supplier_id: 0, tanggal: new Date().toISOString().slice(0, 10), expected_at: '', catatan: '' });
   const [poItems, setPoItems] = useState<PoDraftItem[]>([{ jenis: 'supply', referensi_id: 0, qty: '1', harga_satuan: '0' }]);
   const [bayarInput, setBayarInput] = useState({ nominal: '', metode: 'Transfer' as PaymentMethod, keterangan: '' });
@@ -77,7 +84,7 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
       setPayments(pay.payments);
       setBootstrap(boot);
       if (!poInput.supplier_id && sup.suppliers.length > 0) {
-        setPoInput((prev) => ({ ...prev, supplier_id: sup.suppliers.find((s) => s.aktif)?.id ?? sup.suppliers[0].id }));
+        setPoInput((prev) => ({ ...prev, supplier_id: sup.suppliers.find((s) => s.aktif)?.id ?? sup.suppliers[0]?.id ?? 0 }));
       }
     } catch (err) {
       onNotify('error', err instanceof Error ? err.message : 'Gagal memuat data pembelian.');
@@ -111,29 +118,101 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
     .filter((po) => po.status === 'diterima')
     .reduce((sum, po) => sum + Math.max(0, po.total - (po.sudah_dibayar ?? 0)), 0);
 
+  const openSupplierForm = (supplier?: SupplierRow) => {
+    setSupplierEdit(supplier ?? null);
+    setSupplierInput(
+      supplier
+        ? {
+            kode_supplier: supplier.kode_supplier,
+            nama_supplier: supplier.nama_supplier,
+            kontak: supplier.kontak ?? '',
+            no_wa: supplier.no_wa ?? '',
+            alamat: supplier.alamat ?? '',
+            npwp: supplier.npwp ?? '',
+            aktif: supplier.aktif,
+          }
+        : { kode_supplier: '', nama_supplier: '', kontak: '', no_wa: '', alamat: '', npwp: '', aktif: true },
+    );
+    setSupplierForm(true);
+  };
+
+  const nonaktifSupplier = async (supplier: SupplierRow) => {
+    if (!window.confirm(`Nonaktifkan supplier ${supplier.nama_supplier}?`)) return;
+    try {
+      await apiFetch(`/api/owner/suppliers/${supplier.id}/nonaktif`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      setSupplierEdit(null);
+      onNotify('success', `Supplier ${supplier.nama_supplier} dinonaktifkan.`);
+      await load();
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal menonaktifkan supplier.');
+    }
+  };
+
   const submitSupplier = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await apiFetch('/api/owner/suppliers', { method: 'POST', body: JSON.stringify(supplierInput) });
+      await apiFetch(supplierEdit ? `/api/owner/suppliers/${supplierEdit.id}` : '/api/owner/suppliers', {
+        method: supplierEdit ? 'PUT' : 'POST',
+        body: JSON.stringify(supplierInput),
+      });
       setSupplierForm(false);
-      setSupplierInput({ kode_supplier: '', nama_supplier: '', kontak: '', no_wa: '', alamat: '', npwp: '' });
-      onNotify('success', 'Supplier berhasil ditambahkan.');
+      setSupplierEdit(null);
+      setSupplierInput({ kode_supplier: '', nama_supplier: '', kontak: '', no_wa: '', alamat: '', npwp: '', aktif: true });
+      onNotify('success', supplierEdit ? 'Supplier berhasil diperbarui.' : 'Supplier berhasil ditambahkan.');
       await load();
     } catch (err) {
       onNotify('error', err instanceof Error ? err.message : 'Gagal menyimpan supplier.');
     }
   };
 
+  const openPoDetail = async (po: PurchaseOrder) => {
+    try {
+      const res = await apiFetch<{
+        purchase_order: PurchaseOrder;
+        goods_receipts: GoodsReceipt[];
+        payments: SupplierPayment[];
+      }>(`/api/owner/purchase-orders/${po.id}`);
+      setDetailPo(res);
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal memuat detail PO.');
+    }
+  };
+
+  const openPoForm = (po?: PurchaseOrder) => {
+    setPoEditId(po?.id ?? null);
+    setPoInput({
+      supplier_id: po?.supplier_id ?? suppliers.find((s) => s.aktif)?.id ?? suppliers[0]?.id ?? 0,
+      tanggal: po?.tanggal ?? new Date().toISOString().slice(0, 10),
+      expected_at: po?.expected_at ?? '',
+      catatan: po?.catatan ?? '',
+    });
+    setPoItems(
+      po && po.items.length > 0
+        ? po.items.map((item) => ({
+            jenis: item.jenis,
+            referensi_id: item.referensi_id,
+            qty: String(item.qty),
+            harga_satuan: String(item.harga_satuan),
+          }))
+        : [{ jenis: 'supply', referensi_id: 0, qty: '1', harga_satuan: '0' }],
+    );
+    setPoForm(true);
+  };
+
   const submitPo = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await apiFetch('/api/owner/purchase-orders', {
-        method: 'POST',
+      await apiFetch(poEditId ? `/api/owner/purchase-orders/${poEditId}` : '/api/owner/purchase-orders', {
+        method: poEditId ? 'PUT' : 'POST',
         body: JSON.stringify({ ...poInput, items: poItems }),
       });
       setPoForm(false);
+      setPoEditId(null);
       setPoItems([{ jenis: 'supply', referensi_id: 0, qty: '1', harga_satuan: '0' }]);
-      onNotify('success', 'Purchase order berhasil dibuat.');
+      onNotify('success', poEditId ? 'Purchase order berhasil diperbarui.' : 'Purchase order berhasil dibuat.');
       await load();
     } catch (err) {
       onNotify('error', err instanceof Error ? err.message : 'Gagal menyimpan purchase order.');
@@ -170,11 +249,13 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
     }
   };
 
-  const unduh = (type: string) => {
+  const unduh = async (type: string) => {
     const qs = new URLSearchParams({ type });
-    const token = getApiToken();
-    if (token) qs.set('token', token);
-    window.open(`/api/owner/reports/export?${qs.toString()}`, '_blank', 'noopener');
+    try {
+      await downloadAuthorized(`/api/owner/reports/export?${qs.toString()}`, `reffo-${type}.csv`);
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal mengekspor data.');
+    }
   };
 
   return (
@@ -236,7 +317,7 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
         <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
           <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
             <h3 className="font-semibold text-slate-900 text-sm">Daftar Purchase Order</h3>
-            <button type="button" onClick={() => setPoForm(true)} className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-800 cursor-pointer">
+            <button type="button" onClick={() => openPoForm()} className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-800 cursor-pointer">
               <Plus className="h-3.5 w-3.5" />
               Buat PO
             </button>
@@ -271,6 +352,16 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
                     </td>
                     <td className="px-4 py-2.5 text-right">
                       <div className="inline-flex flex-wrap justify-end gap-1.5">
+                        <button type="button" onClick={() => openPoDetail(po)} className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 cursor-pointer">
+                          <Eye className="h-3 w-3" />
+                          Detail
+                        </button>
+                        {po.status === 'draft' && (
+                          <button type="button" onClick={() => openPoForm(po)} className="inline-flex items-center gap-1 rounded-md border border-blue-300 bg-blue-50 px-2.5 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-100 cursor-pointer">
+                            <Pencil className="h-3 w-3" />
+                            Edit
+                          </button>
+                        )}
                         {po.status === 'draft' && (
                           <button type="button" onClick={() => aksiPo(po, 'kirim')} className="rounded-md bg-blue-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-blue-700 cursor-pointer">
                             Kirim
@@ -316,7 +407,7 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
         <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
           <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
             <h3 className="font-semibold text-slate-900 text-sm">Daftar Supplier</h3>
-            <button type="button" onClick={() => setSupplierForm(true)} className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-800 cursor-pointer">
+            <button type="button" onClick={() => openSupplierForm()} className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-800 cursor-pointer">
               <Plus className="h-3.5 w-3.5" />
               Tambah Supplier
             </button>
@@ -331,6 +422,7 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
                   <th className="px-4 py-2.5 text-left">No WA</th>
                   <th className="px-4 py-2.5 text-right">Hutang</th>
                   <th className="px-4 py-2.5 text-left">Status</th>
+                  <th className="px-4 py-2.5 text-right">Aksi</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -342,6 +434,20 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
                     <td className="px-4 py-2.5 font-mono text-slate-600">{s.no_wa ?? '-'}</td>
                     <td className="px-4 py-2.5 text-right font-mono">{formatRupiah(s.total_hutang ?? 0)}</td>
                     <td className="px-4 py-2.5 text-xs text-slate-600">{s.aktif ? 'Aktif' : 'Nonaktif'}</td>
+                    <td className="px-4 py-2.5 text-right">
+                      <div className="inline-flex flex-wrap justify-end gap-1.5">
+                        <button type="button" onClick={() => openSupplierForm(s)} className="inline-flex items-center gap-1 rounded-md border border-blue-300 bg-blue-50 px-2.5 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-100 cursor-pointer">
+                          <Pencil className="h-3 w-3" />
+                          Edit
+                        </button>
+                        {s.aktif && (
+                          <button type="button" onClick={() => nonaktifSupplier(s)} className="inline-flex items-center gap-1 rounded-md border border-rose-300 bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700 hover:bg-rose-100 cursor-pointer">
+                            <Ban className="h-3 w-3" />
+                            Nonaktifkan
+                          </button>
+                        )}
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -400,8 +506,10 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
           <form onSubmit={submitSupplier} className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="font-display text-base font-semibold text-slate-900">Tambah Supplier</h3>
-              <button type="button" onClick={() => setSupplierForm(false)} className="text-slate-500 cursor-pointer"><X className="h-4 w-4" /></button>
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                {supplierEdit ? `Edit Supplier ${supplierEdit.kode_supplier}` : 'Tambah Supplier'}
+              </h3>
+              <button type="button" onClick={() => { setSupplierForm(false); setSupplierEdit(null); }} className="text-slate-500 cursor-pointer"><X className="h-4 w-4" /></button>
             </div>
             {([
               ['kode_supplier', 'Kode Supplier'],
@@ -421,8 +529,17 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
                 />
               </div>
             ))}
+            <label className="flex items-center gap-2 text-xs font-medium text-slate-700">
+              <input
+                type="checkbox"
+                checked={supplierInput.aktif}
+                onChange={(e) => setSupplierInput((prev) => ({ ...prev, aktif: e.target.checked }))}
+                className="h-4 w-4"
+              />
+              Supplier aktif
+            </label>
             <div className="flex justify-end gap-2 pt-2">
-              <button type="button" onClick={() => setSupplierForm(false)} className="rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 cursor-pointer">Batal</button>
+              <button type="button" onClick={() => { setSupplierForm(false); setSupplierEdit(null); }} className="rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 cursor-pointer">Batal</button>
               <button type="submit" className="rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white cursor-pointer">Simpan</button>
             </div>
           </form>
@@ -433,13 +550,21 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
           <form onSubmit={submitPo} className="w-full max-w-2xl rounded-xl border border-slate-200 bg-white p-6 space-y-3 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between">
-              <h3 className="font-display text-base font-semibold text-slate-900">Buat Purchase Order</h3>
-              <button type="button" onClick={() => setPoForm(false)} className="text-slate-500 cursor-pointer"><X className="h-4 w-4" /></button>
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                {poEditId ? 'Edit Purchase Order Draft' : 'Buat Purchase Order'}
+              </h3>
+              <button type="button" onClick={() => { setPoForm(false); setPoEditId(null); }} className="text-slate-500 cursor-pointer"><X className="h-4 w-4" /></button>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <label className="text-xs font-medium text-slate-700">Supplier *
                 <select required value={poInput.supplier_id} onChange={(e) => setPoInput((prev) => ({ ...prev, supplier_id: Number(e.target.value) }))} className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-2 text-sm">
-                  {suppliers.filter((s) => s.aktif).map((s) => <option key={s.id} value={s.id}>{s.nama_supplier}</option>)}
+                  {suppliers
+                    .filter((s) => s.aktif || s.id === poInput.supplier_id)
+                    .map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.nama_supplier}{s.aktif ? '' : ' (Nonaktif)'}
+                      </option>
+                    ))}
                 </select>
               </label>
               <label className="text-xs font-medium text-slate-700">Tanggal
@@ -487,7 +612,7 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
               <input value={poInput.catatan} onChange={(e) => setPoInput((prev) => ({ ...prev, catatan: e.target.value }))} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
             </label>
             <div className="flex justify-end gap-2 pt-2">
-              <button type="button" onClick={() => setPoForm(false)} className="rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 cursor-pointer">Batal</button>
+              <button type="button" onClick={() => { setPoForm(false); setPoEditId(null); }} className="rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 cursor-pointer">Batal</button>
               <button type="submit" className="rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white cursor-pointer">Simpan PO</button>
             </div>
           </form>
@@ -520,6 +645,86 @@ export const OwnerPurchasingView: React.FC<OwnerPurchasingViewProps> = ({ onNoti
               <button type="submit" className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white cursor-pointer">Catat Pembayaran</button>
             </div>
           </form>
+        </div>
+      )}
+
+      {detailPo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-2xl rounded-xl border border-slate-200 bg-white p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="font-display text-base font-semibold text-slate-900">
+                  Detail PO {detailPo.purchase_order.no_po}
+                </h3>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  {detailPo.purchase_order.supplier_name ?? '-'} ·{' '}
+                  {formatTanggalSingkat(detailPo.purchase_order.tanggal)}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className={`inline-block rounded-md border px-2 py-0.5 text-[11px] font-semibold ${statusPoClass(detailPo.purchase_order.status)}`}>
+                  {STATUS_PO[detailPo.purchase_order.status] ?? detailPo.purchase_order.status}
+                </span>
+                <button type="button" onClick={() => setDetailPo(null)} className="text-slate-500 cursor-pointer"><X className="h-4 w-4" /></button>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div className="rounded-lg bg-slate-50 p-2"><p className="text-slate-500">Total</p><p className="font-mono font-semibold text-slate-900">{formatRupiah(detailPo.purchase_order.total)}</p></div>
+              <div className="rounded-lg bg-slate-50 p-2"><p className="text-slate-500">Sudah Dibayar</p><p className="font-mono font-semibold text-emerald-700">{formatRupiah(detailPo.purchase_order.sudah_dibayar)}</p></div>
+              <div className="rounded-lg bg-slate-50 p-2"><p className="text-slate-500">Sisa Hutang</p><p className="font-mono font-semibold text-rose-700">{formatRupiah(Math.max(0, detailPo.purchase_order.total - detailPo.purchase_order.sudah_dibayar))}</p></div>
+              <div className="rounded-lg bg-slate-50 p-2"><p className="text-slate-500">Estimasi Terima</p><p className="font-medium text-slate-800">{detailPo.purchase_order.expected_at ? formatTanggalSingkat(detailPo.purchase_order.expected_at) : '-'}</p></div>
+            </div>
+            {detailPo.purchase_order.catatan && (
+              <p className="rounded-lg border border-slate-200 p-2 text-xs text-slate-600">
+                Catatan: {detailPo.purchase_order.catatan}
+              </p>
+            )}
+            <div className="overflow-x-auto rounded-lg border border-slate-200">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-50 text-slate-500">
+                  <tr><th className="px-3 py-2 text-left">Barang</th><th className="px-3 py-2 text-right">Qty</th><th className="px-3 py-2 text-right">Harga</th><th className="px-3 py-2 text-right">Subtotal</th></tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {detailPo.purchase_order.items.map((item) => (
+                    <tr key={item.id}>
+                      <td className="px-3 py-2 text-slate-800">{item.nama_barang}</td>
+                      <td className="px-3 py-2 text-right font-mono">{item.qty} {item.satuan}</td>
+                      <td className="px-3 py-2 text-right font-mono">{formatRupiah(item.harga_satuan)}</td>
+                      <td className="px-3 py-2 text-right font-mono">{formatRupiah(item.subtotal)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div className="rounded-lg border border-slate-200 p-3">
+                <p className="font-semibold text-slate-800">Penerimaan</p>
+                {detailPo.goods_receipts.length === 0 ? (
+                  <p className="mt-1 text-slate-500">Belum ada penerimaan.</p>
+                ) : (
+                  detailPo.goods_receipts.map((gr) => (
+                    <p key={gr.id} className="mt-1 text-slate-600">{gr.no_po} · {formatTanggalSingkat(gr.tanggal)}</p>
+                  ))
+                )}
+              </div>
+              <div className="rounded-lg border border-slate-200 p-3">
+                <p className="font-semibold text-slate-800">Pembayaran</p>
+                {detailPo.payments.length === 0 ? (
+                  <p className="mt-1 text-slate-500">Belum ada pembayaran.</p>
+                ) : (
+                  detailPo.payments.map((p) => (
+                    <p key={p.id} className="mt-1 flex justify-between gap-2 text-slate-600">
+                      <span>{p.metode}</span>
+                      <span className="font-mono">{formatRupiah(p.nominal)}</span>
+                    </p>
+                  ))
+                )}
+              </div>
+            </div>
+            <div className="flex justify-end pt-2">
+              <button type="button" onClick={() => setDetailPo(null)} className="rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 cursor-pointer">Tutup</button>
+            </div>
+          </div>
         </div>
       )}
     </div>

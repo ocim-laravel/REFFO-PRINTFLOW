@@ -66,6 +66,7 @@ import type {
   SupplyUsage,
   TaxPriceMode,
   TaxSettings,
+  TrackingStatus,
   User,
   UserRole,
   WhatsAppEvent,
@@ -1883,6 +1884,7 @@ function buildApp() {
       kurir_nama: null,
       resi_pengiriman: null,
       waktu_serah_terima: null,
+      tracking_status: 'belum_dikirim',
       catatan_pengecualian: null,
       deadline: parsedDeadline.iso,
       created_at: now,
@@ -2342,6 +2344,7 @@ function buildApp() {
       kurir_nama: null,
       resi_pengiriman: null,
       waktu_serah_terima: null,
+      tracking_status: 'belum_dikirim',
       catatan_pengecualian: `Reorder dari ${source.no_nota}`,
       deadline: null,
       created_at: now,
@@ -3314,7 +3317,8 @@ function buildApp() {
           status: 'tersedia',
           created_at: now,
         });
-        offcutId = db.material_offcuts[db.material_offcuts.length - 1].id;
+        const offcutList = db.material_offcuts;
+        offcutId = offcutList[offcutList.length - 1]?.id ?? 0;
       }
 
       db.material_logs.push({
@@ -3525,7 +3529,7 @@ function buildApp() {
         status: 'tersedia',
         created_at: now,
       });
-      offcutId = db.material_offcuts[db.material_offcuts.length - 1].id;
+      offcutId = db.material_offcuts[db.material_offcuts.length - 1]?.id ?? 0;
       gi.offcut_id = offcutId;
     }
 
@@ -3618,7 +3622,8 @@ function buildApp() {
           res.status(422).json({ error: 'Nota item sudah dibatalkan (void).' });
           return;
         }
-        const product = db.products.find((p) => p.id === items[0].product_id);
+        const firstItem = items[0];
+        const product = firstItem ? db.products.find((p) => p.id === firstItem.product_id) : null;
         const machine = mesinUtamaCetak(db, product);
         if (!machine) {
           res.status(422).json({ error: 'Mesin cetak aktif belum tersedia.' });
@@ -3666,7 +3671,7 @@ function buildApp() {
         grupId = id;
         store.persist();
         auditRequest(req, 'operator_grup_dibuat', 'cetak_grup', id, `${operator.name} membuat grup ${grup.kode_grup} (${items.length} item).`);
-        broadcastEvent('production_updated', { orderId: items[0].order_id });
+        broadcastEvent('production_updated', { orderId: items[0]?.order_id ?? 0 });
       },
     );
     if (!grupId) return;
@@ -3927,7 +3932,7 @@ function buildApp() {
         const order = db.orders.find((o) => o.id === i.order_id);
         return !order || !activeOrderRaw(order);
       }) ||
-      hydrated.some((i) => !i.ukuran_kotor || i.product_id !== items[0].product_id)
+      hydrated.some((i) => !i.ukuran_kotor || i.product_id !== items[0]?.product_id)
     ) {
       res.status(422).json({
         error: 'Semua item harus aktif, berstatus antrean/proses cetak, bertipe meteran, dan memakai bahan produk yang sama.',
@@ -3936,7 +3941,7 @@ function buildApp() {
     }
 
     const machine = db.machines.find(
-      (m) => m.id === Number(body.machine_id ?? items[0].machine_id ?? 0) && m.aktif,
+      (m) => m.id === Number(body.machine_id ?? items[0]?.machine_id ?? 0) && m.aktif,
     );
     if (!machine) {
       res.status(422).json({ error: 'Mesin cetak aktif wajib dipilih untuk batch nesting.' });
@@ -3981,7 +3986,7 @@ function buildApp() {
     db.print_batches.push(batch);
     auditRequest(req, 'batch_nesting_created', 'batch', batch.id, `Batch ${batch.kode_batch}: ${ids.length} item, lebar ${stats.lebar_gabungan_m} m.`);
     store.persist();
-    broadcastEvent('production_updated', { orderId: items[0].order_id });
+    broadcastEvent('production_updated', { orderId: items[0]?.order_id ?? 0 });
     res.status(201).json({
       batch: { ...batch, machine_name: machine.nama_mesin, operator_name: operator.name },
       stats,
@@ -4136,6 +4141,80 @@ function buildApp() {
     res.json({ item: store.hydrateItem(item), foto_finishing: item.foto_finishing });
   });
 
+  app.post('/api/finishing/items/:id/stages', requireAuth(['finishing']), uploadPhoto.single('foto'), (req, res) => {
+    const user = getCurrentUser(req);
+    const db = store.getState();
+    const item = db.order_items.find((i) => i.id === parsePositiveId(req.params.id));
+    if (!item || !['antrean_finishing', 'proses_finishing'].includes(item.status_produksi)) {
+      if (req.file) cleanupUploadedFiles([req.file]);
+      res.status(403).json({ error: 'Item tidak berada di antrean finishing.' });
+      return;
+    }
+    const body = (req.body ?? {}) as { stage?: unknown; catatan?: unknown };
+    const stage = String(body.stage ?? '').trim().toLowerCase();
+    const validStages = ['', 'potong', 'laminasi', 'jahit', 'qc_fisik', 'selesai'];
+    if (!validStages.includes(stage as never)) {
+      res.status(422).json({ error: 'Stage harus "potong", "laminasi", "jahit", "qc_fisik" atau "selesai".' });
+      return;
+    }
+    const catatan = String(body.catatan ?? '').trim();
+    const stageValue = stage as ('potong' | 'laminasi' | 'jahit' | 'qc_fisik' | 'selesai');
+    if (req.file) {
+      const now = new Date().toISOString();
+      db.finishing_stages.push({
+        id: store.nextId('finishing_stages'),
+        order_item_id: item.id,
+        stage: stageValue,
+        foto_path: `/uploads/${req.file.filename}`,
+        catatan: catatan || null,
+        created_at: now,
+      });
+      item.updated_at = now;
+      if (stage === 'selesai') {
+        item.status_produksi = 'siap_diambil';
+        enqueueSiapDiambil(item.order_id);
+      } else if (stage === 'qc_fisik') {
+        item.status_produksi = 'proses_finishing';
+      }
+      auditRequest(req, 'finishing_stage', 'finishing_stage', item.id, `Stage ${stage} oleh ${user.name}${catatan ? ` | ${catatan}` : ''}.`);
+      store.persist();
+      broadcastEvent('production_updated', { orderId: item.order_id });
+      res.json({ item: store.hydrateItem(item) });
+    } else {
+      const stageValue = stage as ('potong' | 'laminasi' | 'jahit' | 'qc_fisik' | 'selesai');
+      db.finishing_stages.push({
+        id: store.nextId('finishing_stages'),
+        order_item_id: item.id,
+        stage: stageValue,
+        foto_path: null,
+        catatan: catatan || null,
+        created_at: new Date().toISOString(),
+      });
+      item.updated_at = new Date().toISOString();
+      store.persist();
+      broadcastEvent('production_updated', { orderId: item.order_id });
+      res.json({ item: store.hydrateItem(item) });
+    }
+  });
+
+  app.get('/api/orders/:id/finishing-stages', requireAuth(['finishing', 'admin']), (req, res) => {
+    const db = store.getState();
+    const order = db.orders.find((o) => o.id === Number(req.params.id));
+    if (!order) {
+      res.status(404).json({ error: 'Nota tidak ditemukan.' });
+      return;
+    }
+    const stages = db.finishing_stages
+      .filter((s) => s.order_item_id !== undefined)
+      .map((s) => ({
+        ...s,
+        order_item_id: s.order_item_id,
+        item_nama: db.order_items.find((i) => i.id === s.order_item_id)?.nama_item ?? null,
+      }))
+      .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    res.json({ order_id: order.id, stages, order_no_nota: order.no_nota });
+  });
+
   // --- ADVERTISING WORKFLOW (STRICTLY NON-BILLING) ---
   app.get('/api/advertising/spks', requireAuth(['advertising', 'owner', 'admin']), (req, res) => {
     const db = store.getState();
@@ -4177,7 +4256,76 @@ function buildApp() {
     res.json({ spk });
   });
 
-  // --- SERAH TERIMA (SHARED ADMIN + DIVISIONS) ---
+  app.post('/api/advertising/spks', requireAuth(['advertising']), uploadPhoto.fields([{ name: 'foto_before' }, { name: 'foto_after' }]), (req, res) => {
+    const db = store.getState();
+    const user = getCurrentUser(req);
+    const order = db.orders.find((o) => o.id === Number(req.body?.order_id));
+    if (!order) {
+      res.status(404).json({ error: 'Order tidak ditemukan.' });
+      return;
+    }
+    const body = (req.body ?? {}) as {
+      jenis_pekerjaan?: unknown;
+      ukuran_konstruksi?: unknown;
+      lokasi_pasang?: unknown;
+      catatan_teknis?: unknown;
+      status_lapangan?: SpkFieldStatus;
+      lat?: number | string;
+      lng?: number | string;
+      kurir_nama?: string;
+      resi_pengiriman?: string;
+      travel_status?: string;
+      travel_notes?: string;
+    };
+    const jenis_pekerjaan = String(body.jenis_pekerjaan ?? '').trim();
+    const ukuran_konstruksi = String(body.ukuran_konstruksi ?? '').trim();
+    const lokasi_pasang = String(body.lokasi_pasang ?? '').trim();
+    const catatan_teknis = String(body.catatan_teknis ?? '').trim();
+    const status_lapangan = body.status_lapangan ?? 'antrean';
+    if (!jenis_pekerjaan || !ukuran_konstruksi || !lokasi_pasang) {
+      res.status(422).json({ error: 'jenis_pekerjaan, ukuran_konstruksi, dan lokasi_pasang wajib diisi.' });
+      return;
+    }
+    const spk: NonNullable<typeof db.advertising_spks[number]> = {
+      id: store.nextId('advertising_spks'),
+      order_id: order.id,
+      jenis_pekerjaan,
+      ukuran_konstruksi,
+      lokasi_pasang,
+      catatan_teknis: catatan_teknis || null,
+      status_lapangan,
+      foto_before: null,
+      foto_after: null,
+      lat: null,
+      lng: null,
+      kurir_nama: null,
+      resi_pengiriman: null,
+      travel_status: null,
+      travel_notes: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const files = req.files as any as { [fieldname: string]: Express.Multer.File[] };
+    const fotoBeforeFiles = files?.foto_before;
+    if (fotoBeforeFiles && fotoBeforeFiles.length > 0) {
+      spk.foto_before = `/uploads/${fotoBeforeFiles[0]!.filename}`;
+    }
+    const fotoAfterFiles = files?.foto_after;
+    if (fotoAfterFiles && fotoAfterFiles.length > 0) {
+      spk.foto_after = `/uploads/${fotoAfterFiles[0]!.filename}`;
+    }
+    if (typeof body.lat === 'number') spk.lat = body.lat;
+    if (typeof body.lng === 'number') spk.lng = body.lng;
+    spk.kurir_nama = String(body.kurir_nama ?? '').trim() || null;
+    spk.resi_pengiriman = String(body.resi_pengiriman ?? '').trim() || null;
+    spk.travel_status = String(body.travel_status ?? '').trim() || null;
+    spk.travel_notes = String(body.travel_notes ?? '').trim() || null;
+    db.advertising_spks.push(spk);
+    store.persist();
+    auditRequest(req, 'advertising_spk', 'advertising_spk', spk.id, `SPK dibuat oleh ${user.name}.`);
+    broadcastEvent('spk_updated', { orderId: spk.order_id });
+    res.json({ spk });
+  });
   app.get('/api/serah-terima', requireAuth(['admin', 'desainer', 'operator_cetak', 'finishing', 'advertising']), (req, res) => {
     const user = getCurrentUser(req);
     const q = String(req.query.q ?? '').trim().toLowerCase();
@@ -4228,13 +4376,14 @@ function buildApp() {
         return;
       }
 
-      const { nama_pengambil, no_wa_pengambil, catatan_pengecualian, tanda_tangan_pengambil, kurir_nama, resi_pengiriman } = req.body as {
+      const { nama_pengambil, no_wa_pengambil, catatan_pengecualian, tanda_tangan_pengambil, kurir_nama, resi_pengiriman, tracking_status } = req.body as {
         nama_pengambil?: string;
         no_wa_pengambil?: string;
         catatan_pengecualian?: string;
         tanda_tangan_pengambil?: string;
         kurir_nama?: string;
         resi_pengiriman?: string;
+        tracking_status?: string;
       };
       if (!nama_pengambil?.trim() || !no_wa_pengambil?.trim()) {
         res.status(422).json({ error: 'Nama pengambil dan No. WhatsApp pengambil wajib diisi.' });
@@ -4249,6 +4398,7 @@ function buildApp() {
         }
         signature = value;
       }
+      const status = (tracking_status as TrackingStatus | undefined) ?? 'belum_dikirim';
 
       const now = new Date().toISOString();
       order.nama_pengambil = nama_pengambil.trim();

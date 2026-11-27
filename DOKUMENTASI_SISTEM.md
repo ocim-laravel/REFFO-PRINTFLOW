@@ -138,7 +138,10 @@ Setelah server berjalan, buka http://localhost:3000. Untuk produksi, gunakan NOD
 | APP_URL | - | Base URL untuk link absolut pada pesan WhatsApp dan QR Self-ACC. |
 | MAX_UPLOAD_MB | 20 | Batas ukuran unggahan desain, bukti bayar, dan lampiran. |
 | KOMISI_PERSEN | 1 | Persentase komisi admin pada laporan Owner. |
-| WHATSAPP_WEBHOOK_URL | kosong | Endpoint gateway WhatsApp. Jika kosong, pesan tetap pending di outbox. |
+| WHATSAPP_WEBHOOK_URL | kosong | Endpoint gateway WhatsApp. Untuk bridge lokal isi http://127.0.0.1:3101/send. Jika kosong, pesan tetap pending. |
+| WA_BRIDGE_HOST / PORT | 127.0.0.1 / 3101 | Alamat bridge WhatsApp lokal yang dijalankan dengan npm run wa:bridge. |
+| WA_BRIDGE_AUTH_DIR | wa-bridge/auth | Folder sesi login WhatsApp; QR hanya perlu dipindai sekali. |
+| WA_BRIDGE_TOKEN | kosong | Token bearer bridge. Bila kosong, memakai WHATSAPP_WEBHOOK_TOKEN. |
 | WHATSAPP_WEBHOOK_TOKEN | kosong | Token bearer untuk gateway WhatsApp. |
 | PAJAK_REKLAME_HARI | 30 | Jendela pengingat pajak reklame tahunan (default H-30). |
 | AUTO_CLEAN_TIFF_HARI | 90 | Retensi file TIFF sebelum auto-clean. |
@@ -149,7 +152,7 @@ Setelah server berjalan, buka http://localhost:3000. Untuk produksi, gunakan NOD
 
 ### 2.4 Akun Awal
 
-Semua akun awal memakai password password123. Segera ganti melalui Owner → Staf & Audit Log.
+Semua akun awal memakai password acak yang ditulis ke `data/initial-credentials.txt` saat database baru dibuat. File ini tidak ikut git; login lalu segera ganti melalui Owner → Staf & Audit Log dan hapus file tersebut.
 
 | Nama | Email | Peran |
 | --- | --- | --- |
@@ -318,6 +321,8 @@ Untuk lingkungan Linux, gunakan mysqldump --single-transaction dan simpan juga f
 | --- | --- | --- | --- |
 | WhatsApp Outbox | Lima event: nota_dibuat, preview_siap_acc, siap_diambil, piutang_jatuh_tempo, pajak_reklame_jatuh_tempo. | Sistem, Owner | Pesan antre dengan dedupe; retry otomatis 3 kali. |
 | Gateway WA | Kirim outbox ke WHATSAPP_WEBHOOK_URL bila dikonfigurasi. | Owner | Notifikasi otomatis ke pelanggan. |
+| Bridge WA Lokal | Proses Baileys di PC yang sama (npm run wa:bridge). QR dipindai sekali, tautan Self-ACC otomatis ditambahkan, dedupe ganda dicegah. | Owner | WA otomatis dari localhost tanpa WhatsApp Web manual dan tanpa langganan gateway. |
+| Setting WhatsApp Gateway | Halaman Owner untuk mengubah Webhook URL, token, APP URL, status aktif, dan mengirim pesan uji. Config disimpan di database dengan fallback .env. | Owner | Perubahan gateway langsung berlaku tanpa restart server. |
 | Pajak Reklame | Simpan tanggal expired per instansi; pengingat tahunan H-30 dengan dedupe per instansi/tahun. | Owner | Tidak ada pajak terlewat. |
 | Auto-clean TIFF | Preview file TIFF pada nota selesai yang lewat retensi; hapus hanya file terverifikasi. | Owner | Folder uploads tetap terkendali. |
 | Integrasi & Pemeliharaan | Mengelola webhook, pengingat, dan retry outbox. | Owner | Kontrol integrasi. |
@@ -466,6 +471,14 @@ Untuk lingkungan Linux, gunakan mysqldump --single-transaction dan simpan juga f
 | Pajak reklame | Tanggal expired per instansi; sistem menghitung jatuh tempo tahunan berikutnya dan menyiapkan pengingat H-30 (atau PAJAK_REKLAME_HARI) dengan dedupe per instansi dan tahun. |
 | Auto-clean TIFF | Hanya file_cetak_tiff terverifikasi pada nota selesai yang lewat AUTO_CLEAN_TIFF_HARI yang dihapus; preview dan master tidak tersentuh. |
 
+### Peraturan pajak yang dipakai
+
+- Tarif default: PPN 11% untuk jasa advertising/utils; PPN 12% hanya untuk barang mewah tertentu, jadi tidak dipakai sebagai default sistem. PPh 23 atas jasa 2%, atau 1% bila pelanggan ber-NPWP dan memenuhi syarat pemotongan.
+- DPP dihitung dari nilai sebelum pajak. Bila mode harga `sudah_termasuk_ppn`, DPP ditarik mundur dari harga inclusive (`total / (1 + ppn%)`) agar PPN tidak dihitung dua kali.
+- Prioritas tarif: nilai pada nota → tarif instansi → pengaturan global `tax_settings`. Pengaturan global bisa diubah Owner di menu **Pengaturan → Pajak & Faktur**.
+- PPh 23 otomatis dipotong mengikuti toggle `potong_pph23_otomatis`; nilai final tetap dapat dikoreksi per nota.
+- Tarif di atas adalah konfigurasi awal, bukan nasihat pajak. Owner wajib memverifikasi lagi terhadap peraturan yang berlaku dan kondisi NPWP pelanggan sebelum dipakai untuk faktur resmi.
+
 
 ## 8. Struktur Data Utama
 
@@ -582,7 +595,7 @@ Berikut ringkasan endpoint yang paling sering dipakai. Endpoint selain grup publ
 - Autentikasi memakai token sesi bertanda tangan; dapat dikirim sebagai Bearer token atau cookie. Token juga dipakai oleh frontend untuk memanggil API.
 - ENABLE_DEMO_SWITCH=false mematikan login cepat dan ganti akun. Gunakan email + password pada produksi.
 - SESSION_SECRET wajib diganti dengan string acak panjang sebelum go-live.
-- Semua password seed password123 harus diganti melalui Owner → Staf & Audit Log.
+- Semua password seed acak (`data/initial-credentials.txt`) harus diganti melalui Owner → Staf & Audit Log, lalu file kredensial dihapus.
 - Pembatasan peran diterapkan di server, bukan hanya menyembunyikan menu di UI.
 - Tim Advertising bersifat non-billing: tidak dapat mengakses daftar nota, dan harga/subtotal/pembayaran di-nolkan pada detail nota, serah terima, serta riwayat.
 - Owner tidak termasuk dalam endpoint serah terima; aksi ini dilakukan Admin dan divisi produksi/lapangan.
@@ -602,7 +615,8 @@ Berikut ringkasan endpoint yang paling sering dipakai. Endpoint selain grup publ
 | Access denied untuk database | Kredensial salah | Cek MYSQL_USER/MYSQL_PASSWORD atau buat user khusus. |
 | Login cepat/ganti akun tidak muncul | ENABLE_DEMO_SWITCH=false | Normal untuk produksi. Login memakai email dan password. |
 | Password seed gagal | Data sudah bukan seed atau sudah diganti | Reset lewat Owner → Staf & Audit Log. |
-| Pesan WhatsApp tetap pending | WHATSAPP_WEBHOOK_URL belum diisi | Normal; isi webhook atau retry dari Integrasi & Pemeliharaan. |
+| Pesan WhatsApp tetap pending | WHATSAPP_WEBHOOK_URL belum diisi atau bridge belum connected | Isi webhook / jalankan npm run wa:bridge, lalu cek /health. |
+| Bridge WA menjawab 503 | WhatsApp belum tersambung | Buka /qr untuk memindai atau tunggu reconnect otomatis. |
 | Halaman Self-ACC tidak menampilkan harga | Belum ACC atau payload lama | Normal sebelum ACC. Setelah ACC, muat ulang halaman. |
 | ACC kedua ditolak | Guard keputusan final | Normal. Hubungi admin bila perlu pembatalan/void. |
 | Status revisi tidak bisa ACC | Desainer belum upload preview baru | Minta desainer upload preview; status otomatis kembali menunggu. |

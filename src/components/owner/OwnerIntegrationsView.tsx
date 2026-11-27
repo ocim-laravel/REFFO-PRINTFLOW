@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { BellRing, CalendarClock, Download, Play, RefreshCw, Save, Send, Trash2 } from 'lucide-react';
 import type { WhatsappOutbox, WhatsAppEvent } from '../../types';
-import { apiFetch, getApiToken } from '../../lib/api';
+import { apiFetch, downloadAuthorized } from '../../lib/api';
 import { formatTanggalSingkat } from '../../lib/format';
 
 interface OwnerIntegrationsViewProps {
@@ -210,11 +210,13 @@ export const OwnerIntegrationsView: React.FC<OwnerIntegrationsViewProps> = ({ on
     }
   };
 
-  const unduh = (type: string) => {
+  const unduh = async (type: string) => {
     const qs = new URLSearchParams({ type });
-    const token = getApiToken();
-    if (token) qs.set('token', token);
-    window.open(`/api/owner/reports/export?${qs.toString()}`, '_blank', 'noopener');
+    try {
+      await downloadAuthorized(`/api/owner/reports/export?${qs.toString()}`, `reffo-${type}.csv`);
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Gagal mengekspor data.');
+    }
   };
 
   return (
